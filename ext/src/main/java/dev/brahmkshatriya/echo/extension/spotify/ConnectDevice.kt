@@ -290,23 +290,14 @@ object ConnectDevice {
         contextUri: String? = null,
         force: Boolean = false,
     ): Int? = runCatching {
-        if (System.currentTimeMillis() < blockedUntilMs) {
-            println("SpotifyWidevine: connect blocked")
-            return@runCatching null
-        }
+        if (System.currentTimeMillis() < blockedUntilMs) return@runCatching null
         if (cookie.isNullOrBlank()) return@runCatching null
         val uri = trackUri?.takeIf { it.isNotBlank() } ?: return@runCatching null
         val dev = ensure(cookie, bearer, setting) ?: return@runCatching null
-        // Replay (same uri, rewound) must not reuse the old session's
-        // reported flag/refs: the reference client keys sessions per 30s window, so a
-        // replay is always a fresh start.
         if (force) dropSession(uri)
         val session = sessionFor(uri, durationMs)
         ensureStarted(cookie, bearer, dev, session, contextUri)
-        println("SpotifyWidevine: connect start uri=${uri.takeLast(24)} req=${contextUri?.takeLast(34)} ctx=${session.contextUri?.takeLast(34)}")
         dev.seq
-    }.onFailure {
-        println("SpotifyWidevine: connect FAIL ${it.message?.take(140)}")
     }.getOrNull()
 
     /** Run the start flow unless this session already reported it with the
@@ -334,10 +325,7 @@ object ConnectDevice {
         // like the reference client (play command + skip_to, no transfer call). The
         // dealer answers with the server-issued state refs; PUTs without
         // them are 200ed but painted nowhere.
-        val adopted = playAndAdoptDealerState(cookie, bearer, dev, session, requestedContext)
-        if (!adopted) {
-            println("SpotifyWidevine: connect no dealer state, minted refs only")
-        }
+        playAndAdoptDealerState(cookie, bearer, dev, session, requestedContext)
         // Start-event batch first (Bearer + Cookie, reference shape).
         postBatch(
             cookie, bearer,
@@ -370,15 +358,10 @@ object ConnectDevice {
         fileId: String?,
         durationMs: Long,
     ): Int? = runCatching {
-        if (System.currentTimeMillis() < blockedUntilMs) {
-            println("SpotifyWidevine: connect blocked")
-            return@runCatching null
-        }
+        if (System.currentTimeMillis() < blockedUntilMs) return@runCatching null
         if (cookie.isNullOrBlank()) return@runCatching null
         ensure(cookie, bearer, setting) ?: return@runCatching null
         null
-    }.onFailure {
-        println("SpotifyWidevine: connect FAIL ${it.message?.take(140)}")
     }.getOrNull()
 
     /**
@@ -421,11 +404,7 @@ object ConnectDevice {
         val dur = session.durationMs.coerceAtLeast(0L)
         val pos = if (dur > 0L) positionMs.coerceIn(0L, dur) else positionMs.coerceAtLeast(0L)
         val prev = if (dur > 0L) previousMs.coerceIn(0L, dur) else previousMs.coerceAtLeast(0L)
-        val code = putState(cookie, bearer, dev, session, debugSource, pos, prev, dur, paused, withStats)
-        println("SpotifyWidevine: connect tick $debugSource=$code pos=$pos paused=$paused")
-        code
-    }.onFailure {
-        println("SpotifyWidevine: connect tick FAIL ${it.message?.take(140)}")
+        putState(cookie, bearer, dev, session, debugSource, pos, prev, dur, paused, withStats)
     }.getOrNull()
 
     /**
@@ -457,8 +436,6 @@ object ConnectDevice {
         )
         postBatch(cookie, bearer, events, "verify")
         true
-    }.onFailure {
-        println("SpotifyWidevine: connect verify FAIL ${it.message?.take(140)}")
     }.getOrNull()
 
     private suspend fun ensure(cookie: String, bearer: String, setting: Settings): Device? {
@@ -466,9 +443,6 @@ object ConnectDevice {
         val key = accountKey(cookie)
         device?.takeIf { it.cookieKey == key && now - it.createdAtMs < DEVICE_TTL_MS }
             ?.let { return it }
-        if (device != null) {
-            println("SpotifyWidevine: connect device expired, re-registering")
-        }
         device?.close()
         device = null
         return runCatching {
@@ -478,15 +452,10 @@ object ConnectDevice {
             // one "Echo Spotify" row instead.
             val deviceId = deviceId(setting)
             val (dealerUrl, webgateUrl) = endpoints()
-            println("SpotifyWidevine: connect endpoints dealer=$dealerUrl sp=$webgateUrl")
             val (ws, connectionId, queue) = connectDealer(dealerUrl, bearer)
-            println("SpotifyWidevine: connect dealer id=${connectionId.take(12)}…")
             registerObserver(cookie, bearer, webgateUrl, deviceId, connectionId)
             val seq0 = registerDevice(cookie, bearer, webgateUrl, deviceId, connectionId)
-            println("SpotifyWidevine: connect registered id=${deviceId.take(12)}… seq0=$seq0")
             Device(key, deviceId, webgateUrl, ws, connectionId, queue, seq0).also { device = it }
-        }.onFailure {
-            println("SpotifyWidevine: connect register FAIL ${it.message?.take(140)}")
         }.getOrNull()
     }
 
@@ -608,7 +577,6 @@ object ConnectDevice {
             .put(payload.toByteArray().toRequestBody("application/json".toMediaType()))
             .build()
         client.newCall(req).await().use { resp ->
-            println("SpotifyWidevine: connect observer=${resp.code}")
             if (resp.code == 429) defer(resp, "observer")
         }
     }
@@ -738,20 +706,17 @@ object ConnectDevice {
         client.newCall(req).await().use { resp ->
             val code = resp.code
             val body = runCatching { resp.body.string() }.getOrDefault("")
-            println("SpotifyWidevine: connect state=$code seq=${dev.seq}")
             if (code == 429) {
                 defer(resp, "state")
                 return code
             }
             if (code == 400 || code == 401 || code == 403 || code == 404 || code == 409) {
-                println("SpotifyWidevine: connect device stale ($code), re-register next")
                 dev.close()
                 if (device === dev) device = null
                 dropAllSessions()
                 return code
             }
             if (code == 410) {
-                println("SpotifyWidevine: connect state gone (410), keeping device")
                 return code
             }
             if (resp.isSuccessful && body.isNotBlank()) {
@@ -921,7 +886,6 @@ object ConnectDevice {
             .post(payload.toByteArray().toRequestBody("application/json".toMediaType()))
             .build()
         client.newCall(req).await().use { resp ->
-            println("SpotifyWidevine: connect event $what=${resp.code}")
             if (resp.code == 429) defer(resp, "event-$what")
         }
     }
@@ -963,12 +927,10 @@ object ConnectDevice {
             st.playback?.takeIf { it.isNotBlank() }?.let { session.playback = it }
             st.durationMs?.takeIf { it > 0L }?.let { session.durationMs = it }
             session.contextUri = ctx
-            println("SpotifyWidevine: connect dealer match uri=${session.trackUri.takeLast(24)} ctx=${ctx.takeLast(34)}")
             return true
         }
         // Keep the requested context for the next attempt even on total miss.
         resolved?.let { session.contextUri = it }
-        if (contexts.size > 1) println("SpotifyWidevine: connect dealer miss contexts=${contexts.size}")
         return false
     }
 
@@ -1179,15 +1141,12 @@ object ConnectDevice {
                 .post(payload.toByteArray().toRequestBody("application/json".toMediaType()))
                 .build()
             client.newCall(req).await().use { resp ->
-                println("SpotifyWidevine: connect command=${resp.code}")
                 if (resp.code == 429) defer(resp, "command")
                 if (!resp.isSuccessful) {
                     return@runCatching false
                 }
                 true
             }
-        }.onFailure {
-            println("SpotifyWidevine: connect command FAIL ${it.message?.take(120)}")
         }.getOrNull() ?: false
     }
 
@@ -1218,15 +1177,12 @@ object ConnectDevice {
                 json.parser.parseToJsonElement(it) as? JsonObject
             }
         }
-    }.onFailure {
-        println("SpotifyWidevine: connect cluster FAIL ${it.message?.take(120)}")
     }.getOrNull()
 
     private fun defer(resp: Response, what: String) {
         val ms = resp.header("Retry-After")?.toLongOrNull()?.times(1000L)
             ?.coerceIn(15_000L, 10 * 60_000L) ?: 120_000L
         blockedUntilMs = maxOf(blockedUntilMs, System.currentTimeMillis() + ms)
-        println("SpotifyWidevine: connect $what 429, deferred ${ms / 1000}s")
     }
 
     private fun randomMachineId(): String {
