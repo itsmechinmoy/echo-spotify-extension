@@ -345,8 +345,7 @@ open class SpotifyExtension : ExtensionClient, LoginClient.WebView,
                             throw failure
                         }
                     }
-                    MP4_256, MP4_128, MP4_256_DUAL, MP4_128_DUAL ->
-                        widevineStream(streamable, isDownload)
+                    //MP4_256, MP4_128 -> widevineStream(streamable)
                     else -> throw ClientException.NotSupported(AudioFormat.name(format))
                 }
             }
@@ -358,7 +357,7 @@ open class SpotifyExtension : ExtensionClient, LoginClient.WebView,
         }
     }
 
-    open val showWidevineStreams = true
+    open val showWidevineStreams = false
 
     /** Queued tracks from older extension versions have no fallback file metadata. */
     private suspend fun resolveLegacyFlacFallback(streamable: Streamable): Streamable? {
@@ -392,15 +391,12 @@ open class SpotifyExtension : ExtensionClient, LoginClient.WebView,
         val hasPremium = hasPremium()
         val canvas =
             if (showCanvas) async { queries.canvas(track.id).json.toStreamable() } else null
-        val mediaJson = runCatching {
-            queries.trackPlaybackMedia(track.id).json
+        val mvSourceId = runCatching {
+            queries.trackPlaybackMedia(track.id).json.videoSourceCandidates().firstOrNull()?.substringBefore('@')
         }.getOrNull()
-        val entries = mediaJson?.mediaEntries().orEmpty()
-        entries.forEach { ConnectDevice.note(it.fileId, track.id) }
-        val mvSourceId = mediaJson?.videoSourceCandidates()?.firstOrNull()?.substringBefore('@')
         queries.extendedMetadata(track.id).toTrack(
             hasPremium, true, showWidevineStreams, canvas?.await(),
-            entries, showMv, preferMv, mvSourceId
+            showMv, preferMv, mvSourceId
         ).copy(
             isExplicit = track.isExplicit
         )
