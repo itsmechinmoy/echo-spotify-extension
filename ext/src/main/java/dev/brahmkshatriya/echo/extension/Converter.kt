@@ -828,8 +828,6 @@ data class VideoManifest(
     val segLenSec: Int,
     val durationMs: Long,
     val contents: List<VideoContent>,
-    /** DRM-shaped keys (pssh/kid/license/protection) seen anywhere in the body. */
-    val drmHints: List<String>,
     /** Manifest-declared Widevine license path, if present. */
     val licensePath: String?,
 )
@@ -842,8 +840,6 @@ fun parseVideoManifest(sourceId: String, raw: String): VideoManifest? = runCatch
     val base = bases.firstOrNull { it.contains("video-") }
         ?: bases.firstOrNull() ?: return@runCatching null
     val content0 = root["contents"]?.jsonArray?.firstOrNull() as? JsonObject
-    // Templates + scalars live at ROOT for video manifests — each content
-    // inherits them unless it defines its own.
     fun JsonObject?.Str(key: String): String? =
         (this?.get(key) as? JsonPrimitive)?.contentOrNull
     val fileType = root.Str("file_type") ?: content0.Str("file_type") ?: "mp4"
@@ -879,27 +875,28 @@ fun parseVideoManifest(sourceId: String, raw: String): VideoManifest? = runCatch
         ?.toIntOrNull()?.takeIf { it in 1..30 } ?: 4
     val duration = (root.Str("end_time_millis") ?: content0.Str("end_time_millis"))
         ?.toLongOrNull() ?: 0L
-    val hints = mutableListOf<String>()
-    fun scan(e: JsonElement, depth: Int) {
-        if (depth > 6) return
-        if (e is JsonObject) for ((k, v) in e) {
-            val kl = k.lowercase()
-            if (v is JsonPrimitive && ("pssh" in kl || "kid" in kl || "license" in kl ||
-                        "protect" in kl || "drm" in kl)
-            ) {
-                hints += "$k=${v.contentOrNull?.take(80)}"
-            } else scan(v, depth + 1)
-        } else if (e is JsonArray) e.forEach { scan(it, depth + 1) }
+
+    fun findLicensePath(e: JsonElement, depth: Int = 0): String? {
+        if (depth > 6) return null
+        when (e) {
+            is JsonObject -> for ((k, v) in e) {
+                if (k.equals("license_server_endpoint", ignoreCase = true) && v is JsonPrimitive) {
+                    val s = v.contentOrNull
+                    if (s != null && "widevine" in s) {
+                        return s.substringAfter('=').substringBefore('?').takeIf { it.startsWith("/") } ?: s
+                    }
+                }
+                findLicensePath(v, depth + 1)?.let { return it }
+            }
+            is JsonArray -> for (item in e) findLicensePath(item, depth + 1)?.let { return it }
+            else -> {}
+        }
+        return null
     }
-    scan(root, 0)
-    // The manifest declares its own license endpoint; prefer it over any
-    // hardcoded path (robust to regional/rotation changes).
-    val licPath = hints.firstOrNull {
-        it.startsWith("license_server_endpoint=") && "widevine" in it
-    }?.substringAfter('=')?.substringBefore('?')?.takeIf { it.startsWith("/") }
+
     VideoManifest(
         sourceId, base.trimEnd('/'), fileType, segLen,
-        duration, contents, hints.distinct().take(12), licPath,
+        duration, contents, findLicensePath(root),
     )
 }.getOrNull()
 
