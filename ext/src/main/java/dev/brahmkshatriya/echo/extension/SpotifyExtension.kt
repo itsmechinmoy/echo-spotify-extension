@@ -1024,27 +1024,7 @@ open class SpotifyExtension : ExtensionClient, LoginClient.WebView,
     /** Minted web Bearer + CT reusing the session caches (tracker callbacks). */
     private suspend fun currentAuth(): Triple<String, String, String?>? {
         val cookie = api.cookie ?: return null
-        val now = System.currentTimeMillis()
-        val spDc = extractSpDc(cookie)
-        val cached = spDc != null && spDc == cachedMintSpDc && now < cachedMintExpMs
-        val bearer = if (cached) {
-            cachedMintBearer ?: return null
-        } else {
-            getWebBearer(cookie)?.also {
-                cachedMintSpDc = spDc
-                cachedMintBearer = it
-                cachedMintExpMs = now + MINT_TTL_MS
-            } ?: return null
-        }
-        val ct = if (spDc != null && spDc == cachedCtSpDc && now < cachedCtExpMs) {
-            cachedCt
-        } else {
-            mintWebClientToken(cookie)?.also {
-                cachedCtSpDc = spDc
-                cachedCt = it
-                cachedCtExpMs = now + MINT_TTL_MS
-            }
-        }
+        val (bearer, ct) = runCatching { webAuth() }.getOrNull() ?: return null
         return Triple(cookie, bearer, ct)
     }
 
@@ -1085,16 +1065,14 @@ open class SpotifyExtension : ExtensionClient, LoginClient.WebView,
     private suspend fun videoSource(
         sourceId: String, fallbackDurMs: Long, isDownload: Boolean,
     ): Streamable.Media {
+        if (isDownload) {
+            throw ClientException.NotSupported("Music Video downloads are not supported")
+        }
         val (bearer, ct) = webAuth()
-        // MPD + manifest cache (24h; fauth URLs live 7d): playback revisits
-        // and quality-swaps cost zero GETs. Downloads skip the cache: they
-        // need fresh fauth URLs for a full segment walk, and they never use
-        // the MPD shape (EchoDown has no DASH awareness — single progressive
-        // fmp4 only). Prune week-old artifacts either way, never mid-file.
         val cachedMpd = java.io.File(filesDir, "mv_$sourceId.mpd")
         val jsonFile = java.io.File(filesDir, "mv_$sourceId.json")
         val freshMs = 24 * 3600 * 1000L
-        if (!isDownload && cachedMpd.exists() && jsonFile.exists() &&
+        if (cachedMpd.exists() && jsonFile.exists() &&
             System.currentTimeMillis() - cachedMpd.lastModified() < freshMs
         ) {
             val licPath = runCatching {
@@ -1102,11 +1080,10 @@ open class SpotifyExtension : ExtensionClient, LoginClient.WebView,
             }.getOrNull() ?: "/widevine-license/v1/video/license"
             return videoLicensed(cachedMpd, licPath, bearer, ct, isDownload)
         }
-        // Prune week-old MV artifacts while here (tiny dir hygiene).
-        // Covers mpd/json plus any orphaned mx_ movie files.
+        // Prune week-old MV artifacts (mpd/json).
         runCatching {
             filesDir.listFiles { f ->
-                f.name.startsWith("mv_") || f.name.startsWith("mx_")
+                f.name.startsWith("mv_")
             }?.forEach {
                 if (System.currentTimeMillis() - it.lastModified() > 7 * 24 * 3600 * 1000L) it.delete()
             }
@@ -1120,9 +1097,6 @@ open class SpotifyExtension : ExtensionClient, LoginClient.WebView,
         }
         val manifest = parseVideoManifest(sourceId, raw)
             ?: throw ClientException.NotSupported("Failed to parse video manifest")
-        // CDN fetches ride BARE (browser-verified: Referer + UA + sec-ch-ua
-        // trio ONLY on video-fa). The api client would spray Authorization +
-        // client-token + app-version at the CDN edge — wrong shape, bucket poison.
         suspend fun getCdnBytes(u: String, range: String? = null): ByteArray? = runCatching {
             chromeClient.newCall(
                 Request.Builder().url(u)
@@ -1156,15 +1130,11 @@ open class SpotifyExtension : ExtensionClient, LoginClient.WebView,
                 }
                 val codec = if (kind == "vide") initVideoCodec(init) ?: "avc1.4d401e" else "mp4a.40.2"
                 cands += MvCand(content, p, kind, codec)
-                // All video profiles matter (manifest order is arbitrary);
-                // audio needs one.
                 if (cands.count { it.kind == "vide" } >= 5 &&
                     cands.any { it.kind == "soun" } && psshB64 != null
                 ) break@outer
             }
         }
-        // Seg0 range-check picked reps (first per role + spares): naming
-        // mismatches die here (1 byte), not mid-playback.
         for (role in listOf("vide", "soun")) {
             var taken = 0
             val cap = if (role == "vide") 5 else 1
@@ -1172,8 +1142,6 @@ open class SpotifyExtension : ExtensionClient, LoginClient.WebView,
                 if (taken >= cap) break
                 val seg0U = manifest.segmentUrl(c.content, c.profile, "0") ?: continue
                 if (getCdnBytes(seg0U, "bytes=0-0") == null) continue
-                // Real ladder: avc level → bandwidth, audio measured 160k.
-                // Sorted ascending below so Exo climbs correctly.
                 val bw = if (role == "vide") avcBandwidth(c.codec) else 160000
                 reps += MvRep(c.content, c.profile, c.kind, c.codec, bw)
                 taken++
@@ -1184,16 +1152,10 @@ open class SpotifyExtension : ExtensionClient, LoginClient.WebView,
         if (reps.isEmpty()) {
             throw ClientException.NotSupported("Video has no playable profile")
         }
-        // Ladder order: ascending bandwidth, whatever the manifest order was.
         reps.sortBy { it.bandwidth }
-        // Period timeline: manifest duration wins; track duration fallback;
-        // sane default (a PT0S period makes Exo request out-of-range indices).
         val withDur = manifest.copy(
             durationMs = maxOf(manifest.durationMs, fallbackDurMs).takeIf { it > 0 } ?: 180_000L
         )
-        if (isDownload) {
-            throw ClientException.NotSupported("Music Video downloads disabled")
-        }
         val mpd = buildVideoMpd(withDur, reps, pssh)
         val mpdFile = java.io.File(filesDir, "mv_$sourceId.mpd").apply {
             parentFile?.mkdirs()
@@ -1207,31 +1169,13 @@ open class SpotifyExtension : ExtensionClient, LoginClient.WebView,
         mpdFile: java.io.File, licPath: String, bearer: String, ct: String?,
         isDownload: Boolean,
     ): Streamable.Media {
-        return movieLicensed(
-            mpdFile.toURI().toString(), Streamable.SourceType.DASH,
-            licPath, bearer, ct, isDownload,
-        )
-    }
-
-    /**
-     * License wrapper for an arbitrary manifest/media URL: the SHARED audio
-     * header map + manifest-declared video path, single session. The MV
-     * download hands its assembled single-file URL here with Progressive
-     * type (one encrypted fmp4 their flow already handles); playback keeps
-     * the DASH MPD shape above.
-     */
-    private fun movieLicensed(
-        requestUrl: String, type: Streamable.SourceType,
-        licPath: String, bearer: String, ct: String?,
-        isDownload: Boolean,
-    ): Streamable.Media {
         val license = Streamable.Decryption.Widevine(
             "https://gew1-spclient.spotify.com$licPath".toGetRequest(licenseHeaders(bearer, ct)),
             false,
         )
         return Streamable.Source.Http(
-            request = requestUrl.toGetRequest(),
-            type = type,
+            request = mpdFile.toURI().toString().toGetRequest(),
+            type = Streamable.SourceType.DASH,
             decryption = license,
             quality = 5,
             title = "Music Video",
@@ -1240,21 +1184,21 @@ open class SpotifyExtension : ExtensionClient, LoginClient.WebView,
         ).toMedia()
     }
 
-    /** Web Bearer + CT, minted once per ~10min and reused (V17 discipline).
+    /** Web Bearer + CT, minted once per ~10min and reused.
      * Cache key is sp_dc (long-lived); full cookie rotates and would
-     * re-mint per tap. Feeds the video path (audio mints inline). */
+     * re-mint per tap. */
     private suspend fun webAuth(): Pair<String, String?> {
         val cookie = api.cookie
         val now = System.currentTimeMillis()
         val spDc = cookie?.let { extractSpDc(it) }
-        if (spDc != null && spDc == cachedMintSpDc && now < cachedMintExpMs) {
-            return (cachedMintBearer ?: throw ClientException.LoginRequired()) to cachedCt
-        }
-        val webBearer = cookie?.let { getWebBearer(it) }
-        if (webBearer != null) {
-            cachedMintSpDc = spDc
-            cachedMintBearer = webBearer
-            cachedMintExpMs = now + MINT_TTL_MS
+        val webBearer = if (spDc != null && spDc == cachedMintSpDc && now < cachedMintExpMs) {
+            cachedMintBearer
+        } else {
+            cookie?.let { getWebBearer(it) }?.also {
+                cachedMintSpDc = spDc
+                cachedMintBearer = it
+                cachedMintExpMs = now + MINT_TTL_MS
+            }
         }
         val bearer = webBearer ?: run {
             api.clientTokenManager.ensureValid()
@@ -1279,40 +1223,7 @@ open class SpotifyExtension : ExtensionClient, LoginClient.WebView,
         val fileId = streamable.extras["fileId"] ?: streamable.id
         val mirrors = queries.storageResolve(format, fileId).json.cdnUrl
         val url = mirrors[kotlin.math.abs(fileId.hashCode()) % mirrors.size]
-        val cookie = api.cookie
-        val now = System.currentTimeMillis()
-        val webBearer: String?
-        val spDcKey = cookie?.let { extractSpDc(it) }
-        if (spDcKey != null && spDcKey == cachedMintSpDc && now < cachedMintExpMs) {
-            webBearer = cachedMintBearer
-        } else {
-            webBearer = cookie?.let { getWebBearer(it) }
-            if (webBearer != null) {
-                cachedMintSpDc = spDcKey
-                cachedMintBearer = webBearer
-                cachedMintExpMs = now + MINT_TTL_MS
-            }
-        }
-        val bearer: String
-        val ct: String?
-        if (webBearer != null) {
-            val ctCached = spDcKey != null && spDcKey == cachedCtSpDc && now < cachedCtExpMs
-            val webCt = if (ctCached) {
-                cachedCt
-            } else {
-                cookie?.let { mintWebClientToken(it) }?.also {
-                    cachedCtSpDc = spDcKey
-                    cachedCt = it
-                    cachedCtExpMs = now + MINT_TTL_MS
-                }
-            }
-            bearer = webBearer
-            ct = webCt
-        } else {
-            api.clientTokenManager.ensureValid()
-            bearer = api.getWebAccessToken()
-            ct = api.clientTokenManager.clientToken
-        }
+        val (bearer, ct) = webAuth()
         val headers = licenseHeaders(bearer, ct)
         streamable.extras["gid"]?.takeIf { it.isNotBlank() }?.let { gid ->
             runCatching { "spotify:track:${Base62.encode(gid)}" }.getOrNull()?.let { uri ->
@@ -1321,7 +1232,7 @@ open class SpotifyExtension : ExtensionClient, LoginClient.WebView,
         }
         runCatching {
             ConnectDevice.report(
-                setting, cookie, bearer, ct, format.toIntOrNull(), fileId,
+                setting, api.cookie, bearer, ct, format.toIntOrNull(), fileId,
                 streamable.extras["durMs"]?.toLongOrNull() ?: 0L,
             )
         }
@@ -1375,7 +1286,6 @@ open class SpotifyExtension : ExtensionClient, LoginClient.WebView,
                             CipherSuite.TLS_RSA_WITH_AES_128_CBC_SHA,
                             CipherSuite.TLS_RSA_WITH_AES_256_CBC_SHA,
                         )
-                        .supportsTlsExtensions(true)
                         .build(),
                     ConnectionSpec.MODERN_TLS,
                 )
