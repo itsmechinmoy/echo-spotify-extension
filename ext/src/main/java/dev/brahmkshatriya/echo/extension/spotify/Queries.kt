@@ -32,6 +32,7 @@ import dev.brahmkshatriya.echo.extension.spotify.models.StorageResolve
 import dev.brahmkshatriya.echo.extension.spotify.models.UserFollowers
 import dev.brahmkshatriya.echo.extension.spotify.models.UserProfileView
 import dev.brahmkshatriya.echo.extension.spotify.models.UserTopContent
+import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonObjectBuilder
 import kotlinx.serialization.json.add
 import kotlinx.serialization.json.buildJsonArray
@@ -289,6 +290,36 @@ class Queries(
     suspend fun storageResolve(format: String, id: String) = api.clientQuery<StorageResolve>(
         "storage-resolve/v2/files/audio/interactive/$format/$id?version=10000000&product=9&platform=39&alt=json"
     )
+
+    /**
+     * Web-player media endpoint: the reliable source of licensable MP4 (file id, format)
+     * entries for a track. Extended-metadata AUDIO_FILES is not guaranteed to carry them.
+     */
+    suspend fun trackPlaybackMedia(uri: String) = api.clientQuery<JsonObject>(
+        "track-playback/v1/media/$uri?manifestFileFormat=file_ids_mp4"
+    )
+
+    /**
+     * Music-video manifest (browser-verified): GET
+     * manifests/v9/json/sources/{sourceId}/options/supports_drm. Auth is
+     * EXPLICIT (proven web Bearer + CT passed in) — never the interceptor
+     * token, so manifest auth always matches the license auth class.
+     */
+    suspend fun videoManifest(sourceId: String, bearer: String, ct: String?): String {
+        val builder = Request.Builder()
+            .url("https://gew1-spclient.spotify.com/manifests/v9/json/sources/$sourceId/options/supports_drm")
+            .header("Accept", "*/*")
+            .header("Authorization", "Bearer $bearer")
+            .header("Referer", WebPlayerConfig.REFERER)
+            .header("User-Agent", WebPlayerConfig.USER_AGENT)
+            .header("sec-ch-ua", WebPlayerConfig.SEC_CH_UA)
+            .header("sec-ch-ua-mobile", WebPlayerConfig.SEC_CH_UA_MOBILE)
+            .header("sec-ch-ua-platform", WebPlayerConfig.SEC_CH_UA_PLATFORM)
+        // The api interceptor fills gaps (app-version) but never overrides
+        // explicit headers — Authorization/CT below always win.
+        if (!ct.isNullOrBlank()) builder.header("client-token", ct)
+        return api.callGetBody(builder.build())
+    }
 
     suspend fun colorLyrics(id: String, img: String) = api.clientQuery<ColorLyrics>(
         "color-lyrics/v2/track/$id/image/${urlEncode(img)}?format=json&vocalRemoval=false&market=from_token"
