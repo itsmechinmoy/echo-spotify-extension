@@ -42,8 +42,17 @@ import dev.brahmkshatriya.echo.common.models.Track
 import dev.brahmkshatriya.echo.common.models.User
 import dev.brahmkshatriya.echo.common.settings.SettingSwitch
 import dev.brahmkshatriya.echo.common.settings.Settings
+import dev.brahmkshatriya.echo.common.clients.TrackerClient
+import dev.brahmkshatriya.echo.common.clients.TrackerMarkClient
+import dev.brahmkshatriya.echo.common.models.TrackDetails
 import dev.brahmkshatriya.echo.extension.spotify.AudioFormat
+import dev.brahmkshatriya.echo.extension.spotify.AudioFormat.MP4_128
+import dev.brahmkshatriya.echo.extension.spotify.AudioFormat.MP4_128_DUAL
+import dev.brahmkshatriya.echo.extension.spotify.AudioFormat.MP4_256
+import dev.brahmkshatriya.echo.extension.spotify.AudioFormat.MP4_256_DUAL
 import dev.brahmkshatriya.echo.extension.spotify.Base62
+import dev.brahmkshatriya.echo.extension.spotify.ConnectDevice
+import dev.brahmkshatriya.echo.extension.spotify.SpotifyQueue
 import dev.brahmkshatriya.echo.extension.spotify.AudioFormat.FLAC_FLAC
 import dev.brahmkshatriya.echo.extension.spotify.AudioFormat.FLAC_FLAC_24BIT
 import dev.brahmkshatriya.echo.extension.spotify.AudioFormat.OGG_VORBIS_160
@@ -68,13 +77,17 @@ import kotlinx.coroutines.async
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.coroutineScope
 import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.jsonArray
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
 import kotlinx.serialization.json.long
+import okhttp3.CipherSuite
+import okhttp3.ConnectionSpec
 import okhttp3.Request
 import okhttp3.OkHttpClient
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.RequestBody.Companion.toRequestBody
+import okhttp3.TlsVersion
 import java.io.EOFException
 import java.io.ByteArrayInputStream
 import java.io.IOException
@@ -86,12 +99,15 @@ import javax.crypto.Cipher
 import javax.crypto.CipherInputStream
 import javax.crypto.spec.IvParameterSpec
 import javax.crypto.spec.SecretKeySpec
+import kotlin.io.encoding.Base64
+import kotlin.io.encoding.ExperimentalEncodingApi
 import spotify.extendedmetadata.metadata.ExtendedMetadataProto.ExtensionKind
 
 open class SpotifyExtension : ExtensionClient, LoginClient.WebView,
     SearchFeedClient, HomeFeedClient, LibraryFeedClient, LyricsClient, ShareClient,
     TrackClient, LikeClient, RadioClient, SaveClient,
-    AlbumClient, PlaylistClient, ArtistClient, FollowClient, PlaylistEditClient {
+    AlbumClient, PlaylistClient, ArtistClient, FollowClient, PlaylistEditClient,
+    TrackerClient, TrackerMarkClient {
 
     override suspend fun getSettingItems() = listOf(
         SettingSwitch(
@@ -105,11 +121,25 @@ open class SpotifyExtension : ExtensionClient, LoginClient.WebView,
             "crop_covers",
             "Whether to crop artist and users images to fill the whole circle",
             cropCovers
+        ),
+        SettingSwitch(
+            "Show Music Video",
+            "show_mv",
+            "Whether to list the full music video as a playable variant",
+            showMv
+        ),
+        SettingSwitch(
+            "Prefer Music Video",
+            "prefer_mv",
+            "Whether the music video plays by default instead of the song mix",
+            preferMv
         )
     )
 
     private val showCanvas get() = setting.getBoolean("show_canvas") ?: true
     private val cropCovers get() = setting.getBoolean("crop_covers") ?: true
+    private val showMv get() = setting.getBoolean("show_mv") ?: true
+    private val preferMv get() = setting.getBoolean("prefer_mv") ?: false
 
     lateinit var setting: Settings
     override fun setSettings(settings: Settings) {
@@ -228,7 +258,7 @@ open class SpotifyExtension : ExtensionClient, LoginClient.WebView,
         val list =
             rec.items.mapNotNull { it.data?.toTrack(cropCovers) }.takeIf { it.isNotEmpty() }?.let {
                 listOf(Shelf.Lists.Tracks("${track.id}_more", "More like this", it))
-            } ?: emptyList<Shelf>()
+            } ?: spotifyRadioShelf(track.id)
         val first =
             union.firstArtist?.items?.firstOrNull()?.toShelves(queries, cropCovers) ?: emptyList()
         val other =
@@ -239,6 +269,12 @@ open class SpotifyExtension : ExtensionClient, LoginClient.WebView,
     override suspend fun loadStreamableMedia(
         streamable: Streamable, isDownload: Boolean,
     ): Streamable.Media {
+        val mvSource = streamable.extras["mvSource"]
+        if (streamable.id.startsWith("mv:") || mvSource != null) {
+            val sourceId = mvSource ?: streamable.id.removePrefix("mv:")
+            val dur = streamable.extras["dur"]?.toLongOrNull() ?: 180_000L
+            return videoSource(sourceId, dur, isDownload)
+        }
         return when (streamable.type) {
             Streamable.MediaType.Server -> {
                 if (streamable.extras["podcastExternal"] == "true") {
@@ -246,8 +282,25 @@ open class SpotifyExtension : ExtensionClient, LoginClient.WebView,
                         ?: throw ClientException.NotSupported("Invalid external podcast URL")
                     return Streamable.Source.Http(url.toGetRequest()).toMedia()
                 }
-                api.cookie ?: throw ClientException.LoginRequired()
+                val cookie = api.cookie ?: throw ClientException.LoginRequired()
                 val format = streamable.extras["formatNum"]!!.toInt()
+                val fileId = streamable.extras["fileId"] ?: streamable.id
+
+                streamable.extras["gid"]?.takeIf { it.isNotBlank() }?.let { gid ->
+                    runCatching { "spotify:track:${Base62.encode(gid)}" }.getOrNull()?.let { uri ->
+                        ConnectDevice.note(fileId, uri)
+                    }
+                }
+                runCatching {
+                    val auth = currentAuth()
+                    if (auth != null) {
+                        ConnectDevice.report(
+                            setting, cookie, auth.second, auth.third, format, fileId,
+                            streamable.extras["durMs"]?.toLongOrNull() ?: 0L,
+                        )
+                    }
+                }
+
                 when (format) {
                     AudioFormat.MP3_96, AudioFormat.MP3_160,
                     AudioFormat.MP3_256, AudioFormat.MP3_320 -> {
@@ -292,7 +345,8 @@ open class SpotifyExtension : ExtensionClient, LoginClient.WebView,
                             throw failure
                         }
                     }
-                    //MP4_256, MP4_128 -> widevineStream(streamable)
+                    MP4_256, MP4_128, MP4_256_DUAL, MP4_128_DUAL ->
+                        widevineStream(streamable, isDownload)
                     else -> throw ClientException.NotSupported(AudioFormat.name(format))
                 }
             }
@@ -304,7 +358,7 @@ open class SpotifyExtension : ExtensionClient, LoginClient.WebView,
         }
     }
 
-    open val showWidevineStreams = false
+    open val showWidevineStreams = true
 
     /** Queued tracks from older extension versions have no fallback file metadata. */
     private suspend fun resolveLegacyFlacFallback(streamable: Streamable): Streamable? {
@@ -338,11 +392,157 @@ open class SpotifyExtension : ExtensionClient, LoginClient.WebView,
         val hasPremium = hasPremium()
         val canvas =
             if (showCanvas) async { queries.canvas(track.id).json.toStreamable() } else null
+        val mediaJson = runCatching {
+            queries.trackPlaybackMedia(track.id).json
+        }.getOrNull()
+        val entries = mediaJson?.mediaEntries().orEmpty()
+        entries.forEach { ConnectDevice.note(it.fileId, track.id) }
+        val mvSourceId = mediaJson?.videoSourceCandidates()?.firstOrNull()?.substringBefore('@')
         queries.extendedMetadata(track.id).toTrack(
-            hasPremium, true, showWidevineStreams, canvas?.await()
+            hasPremium, true, showWidevineStreams, canvas?.await(),
+            entries, showMv, preferMv, mvSourceId
         ).copy(
             isExplicit = track.isExplicit
         )
+    }
+
+    private suspend fun spotifyRadioShelf(id: String): List<Shelf> = runCatching {
+        val auth = currentAuth()
+        val queued = if (auth != null) {
+            SpotifyQueue.rip(queries, setting, auth.first, auth.second, id, cropCovers)
+        } else emptyList()
+        if (queued.isNotEmpty()) {
+            return@runCatching listOf(Shelf.Lists.Tracks("${id}_radio", "Radio-like", queued))
+        }
+        val radioUri = queries.seedToPlaylist(id).json.mediaItems.firstOrNull()?.uri
+            ?: return@runCatching emptyList()
+        val tracks = queries.fetchPlaylistContent(radioUri, 0)
+            .json.data.playlistV2.content!!.items!!
+            .mapNotNull { it.itemV2?.data?.toTrack(cropCovers) }
+            .drop(1)
+        if (tracks.isEmpty()) emptyList()
+        else listOf(Shelf.Lists.Tracks("${id}_radio", "Radio-like", tracks))
+    }.getOrDefault(emptyList())
+
+    override suspend fun onPlayingStateChanged(details: TrackDetails?, isPlaying: Boolean) {
+        runCatching {
+            val d = details?.takeIf { it.extensionId == "spotify" } ?: return@runCatching
+            val now = System.currentTimeMillis()
+            val paused = !isPlaying
+            val wall = wallPosition(now)
+            val seekJump = kotlin.math.abs(d.currentPosition - wall) > 8000L
+            val debug = when {
+                seekJump -> "seek"
+                paused != lastTickPaused || d.track.id != lastTickUri -> if (paused) "pause" else "resume"
+                else -> return@runCatching
+            }
+            val (cookie, bearer, ct) = currentAuth() ?: return@runCatching
+            val fileId = ConnectDevice.fileIdForUri(d.track.id)
+            val pos: Long
+            val prev: Long
+            if (debug == "seek") {
+                prev = wall
+                pos = d.currentPosition
+            } else {
+                pos = wall
+                prev = wall
+            }
+            lastTickUri = d.track.id
+            lastTickFile = fileId
+            lastTickPos = pos
+            lastTickDur = d.totalDuration ?: 0L
+            lastTickPaused = paused
+            lastTickMs = now
+            ConnectDevice.tick(
+                setting, cookie, bearer, ct, d.track.id, fileId,
+                pos, prev, d.totalDuration ?: 0L, paused, debug,
+                contextUri = d.context?.id,
+            )
+        }
+    }
+
+    private fun wallPosition(now: Long = System.currentTimeMillis()): Long {
+        val dur = lastTickDur
+        val elapsed = if (lastTickPaused) 0L else now - lastTickMs
+        val pos = lastTickPos + elapsed.coerceAtLeast(0L)
+        return if (dur > 0L) pos.coerceIn(0L, dur) else pos.coerceAtLeast(0L)
+    }
+
+    private fun finalizePosition(): Long {
+        val wall = wallPosition()
+        val dur = lastTickDur
+        return if (dur > 1_000L && wall >= dur - 250L) dur - 250L else wall
+    }
+
+    override suspend fun getMarkAsPlayedDuration(details: TrackDetails): Long? {
+        val dur = details.totalDuration?.takeIf { it > 0L } ?: return 30_000L
+        return minOf(dur, 30_000L)
+    }
+
+    override suspend fun onMarkAsPlayed(details: TrackDetails) {
+        runCatching {
+            if (details.extensionId != "spotify") return@runCatching
+            val (cookie, bearer, ct) = currentAuth() ?: return@runCatching
+            val fileId = ConnectDevice.fileIdForUri(details.track.id)
+            val dur = details.totalDuration ?: lastTickDur
+            val wall = wallPosition()
+            val pos = maxOf(30_000L, wall).let { if (dur > 0L) it.coerceAtMost(dur) else it }
+            ConnectDevice.tick(
+                setting, cookie, bearer, ct, details.track.id, fileId,
+                pos, wall, dur,
+                false, "played_threshold_reached",
+                contextUri = details.context?.id,
+            )
+            ConnectDevice.verify(
+                cookie, bearer, ct, details.track.id, fileId, pos,
+            )
+        }
+    }
+
+    override suspend fun onTrackChanged(details: TrackDetails?) {
+        runCatching {
+            val d = details
+            if (d == null || d.extensionId != "spotify") {
+                lastTickUri?.let { uri ->
+                    val (cookie, bearer, ct) = currentAuth() ?: return@runCatching
+                    val fin = finalizePosition()
+                    ConnectDevice.tick(
+                        setting, cookie, bearer, ct, uri, lastTickFile,
+                        fin, fin, lastTickDur, true, "track_data_finalized", true,
+                    )
+                    ConnectDevice.verify(cookie, bearer, ct, uri, lastTickFile, fin)
+                }
+                if (d == null) lastTickUri = null
+                return@runCatching
+            }
+            val (cookie, bearer, ct) = currentAuth() ?: return@runCatching
+            val replay = lastTickUri == d.track.id &&
+                d.currentPosition < lastTickPos
+            ConnectDevice.startTrack(
+                setting, cookie, bearer, d.track.id, d.totalDuration ?: 0L,
+                contextUri = d.context?.id,
+                force = replay,
+            )
+            val newFile = ConnectDevice.fileIdForUri(d.track.id)
+            val nextPb = newFile?.let { ConnectDevice.sessionIdsFor(it)?.playback } ?: ""
+            if (lastTickUri != null && (lastTickUri != d.track.id || replay)) {
+                val fin = finalizePosition()
+                lastTickUri?.let { uri ->
+                    ConnectDevice.tick(
+                        setting, cookie, bearer, ct, uri, lastTickFile,
+                        fin, fin, lastTickDur, false, "track_data_finalized", true,
+                    )
+                    ConnectDevice.verify(cookie, bearer, ct, uri, lastTickFile, fin, nextPb)
+                }
+            }
+            val fileId = newFile ?: ConnectDevice.fileIdForUri(d.track.id)
+            lastTickUri = d.track.id
+            lastTickFile = fileId
+            lastTickPos = d.currentPosition
+            lastTickDur = d.totalDuration ?: 0L
+            lastTickPaused = false
+            lastTickMs = System.currentTimeMillis()
+        }
     }
 
     private suspend fun createRadio(id: String): Radio {
@@ -821,25 +1021,389 @@ open class SpotifyExtension : ExtensionClient, LoginClient.WebView,
 
     override suspend fun loadLyrics(lyrics: Lyrics) = lyrics
 
-    /*private suspend fun widevineStream(streamable: Streamable): Streamable.Media.Server {
-        val accessToken = api.getWebAccessToken()
-        val url = queries.storageResolve(streamable.id).json.cdnUrl.first()
-        val time = "time=${System.currentTimeMillis()}"
+    /** Minted web Bearer + CT reusing the session caches (tracker callbacks). */
+    private suspend fun currentAuth(): Triple<String, String, String?>? {
+        val cookie = api.cookie ?: return null
+        val (bearer, ct) = runCatching { webAuth() }.getOrNull() ?: return null
+        return Triple(cookie, bearer, ct)
+    }
+
+    /**
+     * THE license header map: browser-verbatim, shared by audio AND video.
+     * Single source of truth — both endpoints live in the same family,
+     * take the same BQC class, and grant under the same shape.
+     */
+    private fun licenseHeaders(bearer: String, ct: String?): MutableMap<String, String> {
+        val headers = mutableMapOf<String, String>()
+        headers["Authorization"] = "Bearer $bearer"
+        if (!ct.isNullOrBlank()) headers["client-token"] = ct
+        headers["Origin"] = WebPlayerConfig.ORIGIN
+        headers["Referer"] = WebPlayerConfig.REFERER
+        headers["User-Agent"] = WebPlayerConfig.USER_AGENT
+        headers["Accept"] = "*/*"
+        headers["Accept-Language"] = WebPlayerConfig.ACCEPT_LANGUAGE
+        headers["sec-ch-ua"] = WebPlayerConfig.SEC_CH_UA
+        headers["sec-ch-ua-mobile"] = WebPlayerConfig.SEC_CH_UA_MOBILE
+        headers["sec-ch-ua-platform"] = WebPlayerConfig.SEC_CH_UA_PLATFORM
+        headers["sec-fetch-dest"] = "empty"
+        headers["sec-fetch-mode"] = "cors"
+        headers["sec-fetch-site"] = "same-site"
+        return headers
+    }
+
+    /**
+     * Full music video on stock Echo, merged A+V in one MPD: the segments
+     * are CENC, one KID covers both profiles (browser-verified: identical
+     * PSSH in both inits), keys come from the manifest-declared video
+     * license endpoint with the SHARED audio headers. The ext fetches tiny
+     * init segments (URL-authed, no CDM) only to learn roles (soun/vide
+     * via hdlr), the real codec (avcC), and the PSSH box — then hands stock
+     * Exo a file: MPD + license URL. Merge is structural: one MPD, two
+     * AdaptationSets, one grant.
+     */
+    @OptIn(ExperimentalEncodingApi::class)
+    private suspend fun videoSource(
+        sourceId: String, fallbackDurMs: Long, isDownload: Boolean,
+    ): Streamable.Media {
+        if (isDownload) {
+            throw ClientException.NotSupported("Music Video downloads are not supported")
+        }
+        val (bearer, ct) = webAuth()
+        val cachedMpd = java.io.File(filesDir, "mv_$sourceId.mpd")
+        val jsonFile = java.io.File(filesDir, "mv_$sourceId.json")
+        val freshMs = 24 * 3600 * 1000L
+        if (cachedMpd.exists() && jsonFile.exists() &&
+            System.currentTimeMillis() - cachedMpd.lastModified() < freshMs
+        ) {
+            val licPath = runCatching {
+                parseVideoManifest(sourceId, jsonFile.readText())?.licensePath
+            }.getOrNull() ?: "/widevine-license/v1/video/license"
+            return videoLicensed(cachedMpd, licPath, bearer, ct, isDownload)
+        }
+        // Prune week-old MV artifacts (mpd/json).
+        runCatching {
+            filesDir.listFiles { f ->
+                f.name.startsWith("mv_")
+            }?.forEach {
+                if (System.currentTimeMillis() - it.lastModified() > 7 * 24 * 3600 * 1000L) it.delete()
+            }
+        }
+        val raw = runCatching { queries.videoManifest(sourceId, bearer, ct) }.getOrElse {
+            throw ClientException.NotSupported("Failed to load video manifest")
+        }
+        runCatching {
+            jsonFile.parentFile?.mkdirs()
+            jsonFile.writeText(raw)
+        }
+        val manifest = parseVideoManifest(sourceId, raw)
+            ?: throw ClientException.NotSupported("Failed to parse video manifest")
+        suspend fun getCdnBytes(u: String, range: String? = null): ByteArray? = runCatching {
+            chromeClient.newCall(
+                Request.Builder().url(u)
+                    .header("User-Agent", WebPlayerConfig.USER_AGENT)
+                    .header("Referer", WebPlayerConfig.REFERER)
+                    .header("sec-ch-ua", WebPlayerConfig.SEC_CH_UA)
+                    .header("sec-ch-ua-mobile", WebPlayerConfig.SEC_CH_UA_MOBILE)
+                    .header("sec-ch-ua-platform", WebPlayerConfig.SEC_CH_UA_PLATFORM)
+                    .apply { if (range != null) header("Range", range) }
+                    .build()
+            ).await().use { resp ->
+                if (!resp.isSuccessful) throw Exception("cdn http=${resp.code}")
+                resp.body.bytes()
+            }
+        }.getOrNull()
+        val reps = mutableListOf<MvRep>()
+        data class MvCand(
+            val content: VideoContent, val profile: String, val kind: String, val codec: String,
+        )
+        val cands = mutableListOf<MvCand>()
+        var psshB64: String? = null
+        var probed = 0
+        outer@ for (content in manifest.contents) {
+            for (p in content.profiles) {
+                if (probed++ >= 8) break@outer
+                val initU = manifest.initUrl(content, p) ?: continue
+                val init = getCdnBytes(initU) ?: continue
+                val kind = initTrackKind(init) ?: continue
+                if (psshB64 == null) {
+                    findInitPssh(init)?.let { psshB64 = Base64.Default.encode(it) }
+                }
+                val codec = if (kind == "vide") initVideoCodec(init) ?: "avc1.4d401e" else "mp4a.40.2"
+                cands += MvCand(content, p, kind, codec)
+                if (cands.count { it.kind == "vide" } >= 5 &&
+                    cands.any { it.kind == "soun" } && psshB64 != null
+                ) break@outer
+            }
+        }
+        for (role in listOf("vide", "soun")) {
+            var taken = 0
+            val cap = if (role == "vide") 5 else 1
+            for (c in cands.filter { it.kind == role }) {
+                if (taken >= cap) break
+                val seg0U = manifest.segmentUrl(c.content, c.profile, "0") ?: continue
+                if (getCdnBytes(seg0U, "bytes=0-0") == null) continue
+                val bw = if (role == "vide") avcBandwidth(c.codec) else 160000
+                reps += MvRep(c.content, c.profile, c.kind, c.codec, bw)
+                taken++
+            }
+        }
+        val pssh = psshB64
+            ?: throw ClientException.NotSupported("Video manifest contains no PSSH")
+        if (reps.isEmpty()) {
+            throw ClientException.NotSupported("Video has no playable profile")
+        }
+        reps.sortBy { it.bandwidth }
+        val withDur = manifest.copy(
+            durationMs = maxOf(manifest.durationMs, fallbackDurMs).takeIf { it > 0 } ?: 180_000L
+        )
+        val mpd = buildVideoMpd(withDur, reps, pssh)
+        val mpdFile = java.io.File(filesDir, "mv_$sourceId.mpd").apply {
+            parentFile?.mkdirs()
+            writeText(mpd)
+        }
+        val licPath = manifest.licensePath ?: "/widevine-license/v1/video/license"
+        return videoLicensed(mpdFile, licPath, bearer, ct, isDownload)
+    }
+
+    private fun videoLicensed(
+        mpdFile: java.io.File, licPath: String, bearer: String, ct: String?,
+        isDownload: Boolean,
+    ): Streamable.Media {
+        val license = Streamable.Decryption.Widevine(
+            "https://gew1-spclient.spotify.com$licPath".toGetRequest(licenseHeaders(bearer, ct)),
+            false,
+        )
+        return Streamable.Source.Http(
+            request = mpdFile.toURI().toString().toGetRequest(),
+            type = Streamable.SourceType.DASH,
+            decryption = license,
+            quality = 5,
+            title = "Music Video",
+            isVideo = true,
+            isLive = !isDownload,
+        ).toMedia()
+    }
+
+    /** Web Bearer + CT, minted once per ~10min and reused.
+     * Cache key is sp_dc (long-lived); full cookie rotates and would
+     * re-mint per tap. */
+    private suspend fun webAuth(): Pair<String, String?> {
+        val cookie = api.cookie
+        val now = System.currentTimeMillis()
+        val spDc = cookie?.let { extractSpDc(it) }
+        val webBearer = if (spDc != null && spDc == cachedMintSpDc && now < cachedMintExpMs) {
+            cachedMintBearer
+        } else {
+            cookie?.let { getWebBearer(it) }?.also {
+                cachedMintSpDc = spDc
+                cachedMintBearer = it
+                cachedMintExpMs = now + MINT_TTL_MS
+            }
+        }
+        val bearer = webBearer ?: run {
+            api.clientTokenManager.ensureValid()
+            api.getWebAccessToken()
+        }
+        val ct = if (webBearer != null) {
+            if (spDc != null && spDc == cachedCtSpDc && now < cachedCtExpMs) cachedCt
+            else cookie?.let { mintWebClientToken(it) }?.also {
+                cachedCtSpDc = spDc
+                cachedCt = it
+                cachedCtExpMs = now + MINT_TTL_MS
+            }
+        } else api.clientTokenManager.clientToken
+        return bearer to ct
+    }
+
+    private suspend fun widevineStream(
+        streamable: Streamable, isDownload: Boolean,
+    ): Streamable.Media.Server {
+        val format = streamable.extras["formatNum"]
+            ?: throw ClientException.NotSupported("Missing format")
+        val fileId = streamable.extras["fileId"] ?: streamable.id
+        val mirrors = queries.storageResolve(format, fileId).json.cdnUrl
+        val url = mirrors[kotlin.math.abs(fileId.hashCode()) % mirrors.size]
+        val (bearer, ct) = webAuth()
+        val headers = licenseHeaders(bearer, ct)
+        streamable.extras["gid"]?.takeIf { it.isNotBlank() }?.let { gid ->
+            runCatching { "spotify:track:${Base62.encode(gid)}" }.getOrNull()?.let { uri ->
+                ConnectDevice.note(fileId, uri)
+            }
+        }
+        runCatching {
+            ConnectDevice.report(
+                setting, api.cookie, bearer, ct, format.toIntOrNull(), fileId,
+                streamable.extras["durMs"]?.toLongOrNull() ?: 0L,
+            )
+        }
+        val licenseUrl = "https://spclient.wg.spotify.com/widevine-license/v1/audio/license"
         val decryption = Streamable.Decryption.Widevine(
-            "https://spclient.wg.spotify.com/widevine-license/v1/audio/license?$time"
-                .toGetRequest(
-                    mapOf(
-                        "Authorization" to "Bearer $accessToken",
-                        "Origin" to "https://open.spotify.com",
-                    )
-                ),
-            true
+            licenseUrl.toGetRequest(headers),
+            true,
         )
         return Streamable.Source.Http(
             request = url.toGetRequest(),
             decryption = decryption,
+            isLive = !isDownload,
         ).toMedia()
-    }*/
+    }
+
+    /** Device id bound to the login session when present (else the install id).
+     * Keeps every minted token tied to the same device. */
+    private fun sessionDeviceId(cookie: String): String {
+        return cookie.split(';')
+            .map { it.trim() }
+            .firstOrNull { it.startsWith("__Host-device_id=") }
+            ?.substringAfter('=')
+            ?.takeIf { it.isNotBlank() }
+            ?: api.deviceId()
+    }
+
+    /** OkHttp with Chrome-ordered TLS cipher suites. OkHttp's defaults advertise
+     * a Java fingerprint that some Spotify front doors refuse; the platform
+     * stack underneath is Chrome-derived, so only the advertised order needs
+     * fixing. Used for the WAF-sensitive mint path. */
+    private val chromeClient by lazy {
+        OkHttpClient.Builder()
+            .connectionSpecs(
+                listOf(
+                    ConnectionSpec.Builder(ConnectionSpec.MODERN_TLS)
+                        .tlsVersions(TlsVersion.TLS_1_3, TlsVersion.TLS_1_2)
+                        .cipherSuites(
+                            CipherSuite.TLS_AES_128_GCM_SHA256,
+                            CipherSuite.TLS_AES_256_GCM_SHA384,
+                            CipherSuite.TLS_CHACHA20_POLY1305_SHA256,
+                            CipherSuite.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
+                            CipherSuite.TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
+                            CipherSuite.TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
+                            CipherSuite.TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
+                            CipherSuite.TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256,
+                            CipherSuite.TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256,
+                            CipherSuite.TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA,
+                            CipherSuite.TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA,
+                            CipherSuite.TLS_RSA_WITH_AES_128_GCM_SHA256,
+                            CipherSuite.TLS_RSA_WITH_AES_256_GCM_SHA384,
+                            CipherSuite.TLS_RSA_WITH_AES_128_CBC_SHA,
+                            CipherSuite.TLS_RSA_WITH_AES_256_CBC_SHA,
+                        )
+                        .build(),
+                    ConnectionSpec.MODERN_TLS,
+                )
+            )
+            .build()
+    }
+
+    /** The browser's full cookie jar: login dump plus anything open.spotify.com
+     * sets on a visit (sp_key et al). The mint endpoint may refuse a partial
+     * jar even when sp_dc itself is valid. */
+    private suspend fun fullCookieJar(cookie: String): String {
+        val jar = linkedMapOf<String, String>()
+        cookie.split(';').map { it.trim() }
+            .filter { it.contains('=') }
+            .forEach { jar[it.substringBefore('=')] = it.substringAfter('=') }
+        runCatching {
+            val req = Request.Builder()
+                .url("https://open.spotify.com/")
+                .header("User-Agent", WebPlayerConfig.USER_AGENT)
+                .header("Accept", "text/html,application/xhtml+xml")
+                .header("Cookie", cookie)
+                .build()
+            chromeClient.newCall(req).await().use { resp ->
+                resp.headers.values("Set-Cookie").forEach { sc ->
+                    val pair = sc.substringBefore(';').trim()
+                    if (pair.contains('=')) {
+                        jar[pair.substringBefore('=')] = pair.substringAfter('=')
+                    }
+                }
+            }
+        }
+        return jar.entries.joinToString("; ") { "${it.key}=${it.value}" }
+    }
+
+    private suspend fun getWebBearer(cookie: String): String? {
+        val spDc = extractSpDc(cookie)
+        if (spDc != null) {
+            val token = runCatching {
+                val url = api.web.getWebTokenUrl("transport")
+                val req = Request.Builder()
+                    .url(url)
+                    .header("User-Agent", WebPlayerConfig.USER_AGENT)
+                    .header("Accept", "application/json")
+                    .header("Accept-Language", WebPlayerConfig.ACCEPT_LANGUAGE)
+                    .header("Referer", WebPlayerConfig.REFERER)
+                    .header("sec-ch-ua", WebPlayerConfig.SEC_CH_UA)
+                    .header("sec-ch-ua-mobile", WebPlayerConfig.SEC_CH_UA_MOBILE)
+                    .header("sec-ch-ua-platform", WebPlayerConfig.SEC_CH_UA_PLATFORM)
+                    .header("sec-fetch-dest", "empty")
+                    .header("sec-fetch-mode", "cors")
+                    .header("sec-fetch-site", "same-origin")
+                    .header("Cookie", "sp_dc=$spDc")
+                    .build()
+                chromeClient.newCall(req).await().use { resp ->
+                    if (!resp.isSuccessful) null
+                    else api.json.decode<JsonObject>(resp.body.string())
+                        .jsonObject["accessToken"]?.jsonPrimitive?.content
+                        ?.takeIf { it.isNotBlank() }
+                }
+            }.getOrNull()
+            if (!token.isNullOrBlank()) return token
+        }
+        return runCatching {
+            val jar = fullCookieJar(cookie)
+            val req = Request.Builder()
+                .url("https://open.spotify.com/get_access_token?reason=transport&productType=web-player")
+                .header("User-Agent", WebPlayerConfig.USER_AGENT)
+                .header("Accept", "*/*")
+                .header("Accept-Language", WebPlayerConfig.ACCEPT_LANGUAGE)
+                .header("Referer", WebPlayerConfig.REFERER)
+                .header("Origin", WebPlayerConfig.ORIGIN)
+                .header("sec-ch-ua", WebPlayerConfig.SEC_CH_UA)
+                .header("sec-ch-ua-mobile", WebPlayerConfig.SEC_CH_UA_MOBILE)
+                .header("sec-ch-ua-platform", WebPlayerConfig.SEC_CH_UA_PLATFORM)
+                .header("sec-fetch-dest", "empty")
+                .header("sec-fetch-mode", "cors")
+                .header("sec-fetch-site", "same-site")
+                .header("Cookie", jar)
+                .build()
+            chromeClient.newCall(req).await().use { resp ->
+                if (!resp.isSuccessful) null
+                else api.json.decode<JsonObject>(resp.body.string())
+                    .jsonObject["accessToken"]?.jsonPrimitive?.content
+            }
+        }.getOrNull()
+    }
+
+    private fun extractSpDc(cookie: String): String? = cookie.split(';')
+        .map { it.trim() }
+        .firstOrNull { it.startsWith("sp_dc=") }
+        ?.substringAfter('=')
+        ?.takeIf { it.isNotBlank() }
+
+    private suspend fun mintWebClientToken(cookie: String): String? = runCatching {
+        val deviceId = sessionDeviceId(cookie)
+        val body = """{"client_data":{"client_version":"${WebPlayerConfig.appVersion}","client_id":"${WebPlayerConfig.CLIENT_ID}","js_sdk_data":{"device_brand":"unknown","device_id":"$deviceId","device_model":"unknown","device_type":"computer","os":"windows","os_version":"NT 10.0"}}}"""
+        val req = Request.Builder()
+            .url("https://clienttoken.spotify.com/v1/clienttoken")
+            .header("User-Agent", WebPlayerConfig.USER_AGENT)
+            .header("Accept-Language", WebPlayerConfig.ACCEPT_LANGUAGE)
+            .header("Origin", WebPlayerConfig.ORIGIN)
+            .header("Referer", WebPlayerConfig.REFERER)
+            .header("Sec-Fetch-Dest", "empty")
+            .header("Sec-Fetch-Mode", "cors")
+            .header("Sec-Fetch-Site", "same-site")
+            .header("Accept", "application/json")
+            .header("content-type", "application/json")
+            .header("Connection", "keep-alive")
+            .header("Cookie", cookie)
+            .post(body.toByteArray().toRequestBody("application/json".toMediaType()))
+            .build()
+        okhttp3.OkHttpClient().newCall(req).await().use { response ->
+            if (!response.isSuccessful) return@runCatching null
+            api.json.decode<JsonObject>(response.body.string())
+                .jsonObject["granted_token"]?.jsonObject
+                ?.get("token")?.jsonPrimitive?.content
+        }
+    }.getOrNull()
 
     open suspend fun getKey(json: Json, accessToken: String, fileId: String): ByteArray {
         require(fileId.matches(Regex("[0-9a-fA-F]{40}"))) { "Invalid Spotify audio file ID" }
@@ -933,6 +1497,24 @@ open class SpotifyExtension : ExtensionClient, LoginClient.WebView,
     }
 
     companion object {
+        /** V18: session caches keyed by sp_dc (stable across cookie rotation). */
+        var cachedMintSpDc: String? = null
+        var cachedMintBearer: String? = null
+        var cachedMintExpMs: Long = 0L
+        var cachedCtSpDc: String? = null
+        var cachedCt: String? = null
+        var cachedCtExpMs: Long = 0L
+
+        const val MINT_TTL_MS = 600_000L
+
+        /** Tracker throttle: last reported tick (skip/pause/seek spam guard). */
+        var lastTickUri: String? = null
+        var lastTickFile: String? = null
+        var lastTickPos: Long = 0L
+        var lastTickDur: Long = 0L
+        var lastTickPaused: Boolean = false
+        var lastTickMs: Long = 0L
+
         private val AUDIO_IV = BigInteger("72e067fbddcbcf77ebe8bc643f630d93", 16)
         private fun BigInteger.to16ByteArray(): ByteArray {
             val full = toByteArray()

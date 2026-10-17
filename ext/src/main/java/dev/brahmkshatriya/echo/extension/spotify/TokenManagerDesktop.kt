@@ -57,20 +57,29 @@ class TokenManagerDesktop(
         }
     }
 
-    @OptIn(ExperimentalStdlibApi::class)
-    private suspend fun getAnonymousTokenUrl(): String {
+    @OptIn(ExperimentalStdlibApi::class, ExperimentalEncodingApi::class)
+    suspend fun getWebTokenUrl(reason: String = "transport"): String {
         val (secret, version) = getDataFromSite()
         val time = System.currentTimeMillis()
         val totp = TOTP.generateTOTP(secret, (time / 30000).toHexString().uppercase())
         return "https://open.spotify.com/api/token" +
-                "?reason=init&productType=web-player&totp=$totp&totpServer=$totp&totpVer=$version"
+                "?reason=$reason&productType=web-player&totp=$totp&totpServer=$totp&totpVer=$version"
     }
+
+    private suspend fun getAnonymousTokenUrl(): String = getWebTokenUrl("init")
 
     private val secretsUrl =
         "https://raw.githubusercontent.com/itsmechinmoy/echo-extensions/refs/heads/main/noidea.txt"
 
+    private var cachedSecret: Secret? = null
+    private var cachedSecretTime: Long = 0
+
     @OptIn(ExperimentalEncodingApi::class)
     private suspend fun getDataFromSite(): Secret {
+        val now = System.currentTimeMillis()
+        cachedSecret?.let {
+            if (now - cachedSecretTime < 3600_000L) return it
+        }
         val string = client.newCall(
             Request.Builder()
                 .url(secretsUrl)
@@ -78,7 +87,10 @@ class TokenManagerDesktop(
                 .build()
         ).await().body.string()
         val (secret, version) = json.decode<Secret>(string)
-        return Secret(convertToHex(secret), version)
+        val s = Secret(convertToHex(secret), version)
+        cachedSecret = s
+        cachedSecretTime = now
+        return s
     }
 
     companion object {
