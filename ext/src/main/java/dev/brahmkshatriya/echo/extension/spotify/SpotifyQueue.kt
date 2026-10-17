@@ -72,7 +72,6 @@ object SpotifyQueue {
             idx = next
         }
         if (ids.isEmpty()) return@runCatching
-        println("SpotifyWidevine: queue harvest seed=${currentId.takeLast(8)} tracks=${ids.size}")
         synchronized(cache) {
             val tracks = ids.mapNotNull { id ->
                 cache[currentId]?.tracks?.firstOrNull { it.id == "spotify:track:$id" }
@@ -104,7 +103,6 @@ object SpotifyQueue {
             // skip the fetch entirely instead of spamming cluster for a
             // guaranteed miss. The tracker start warms it on actual playback.
             if (!ConnectDevice.hasSession(seedTrackUri)) {
-                println("SpotifyWidevine: queue cold seed=${seedId.takeLast(8)}")
                 return@runCatching emptyList()
             }
             // Two attempts like the reference (cluster lands right after a
@@ -121,7 +119,6 @@ object SpotifyQueue {
                 ?: (root["cluster"] as? JsonObject)?.playerState()
                 ?: return@runCatching emptyList()
             if (player.currentId() != seedId) {
-                println("SpotifyWidevine: queue miss current=${player.currentId()?.takeLast(8)} seed=${seedId.takeLast(8)}")
                 return@runCatching emptyList()
             }
             val seen = linkedSetOf(seedId)
@@ -143,8 +140,6 @@ object SpotifyQueue {
                 .json.data.lookup.mapNotNull { item ->
                     item.data?.toMediaItem(cropCovers) as? Track
                 }.associateBy { it.id.toTrackId() ?: it.id }
-        }.onFailure {
-            println("SpotifyWidevine: queue hydrate FAIL ${it.message?.take(120)}")
         }.getOrDefault(emptyMap())
         val tracks = list.asSequence()
             .map { raw ->
@@ -161,7 +156,6 @@ object SpotifyQueue {
             .distinctBy { it.id }
             .take(limit)
             .toList()
-        println("SpotifyWidevine: queue rip seed=${seedId.takeLast(8)} tracks=${tracks.size}")
         if (tracks.isNotEmpty()) {
             synchronized(cache) {
                 cache[seedId] = Entry(tracks, System.currentTimeMillis())
@@ -169,8 +163,6 @@ object SpotifyQueue {
             }
         }
         tracks
-    }.onFailure {
-        println("SpotifyWidevine: queue rip FAIL ${it.message?.take(140)}")
     }.getOrDefault(emptyList())
 
     /** Cluster meta wins; hydrated fills blanks (their mergeWithHydrated). */
