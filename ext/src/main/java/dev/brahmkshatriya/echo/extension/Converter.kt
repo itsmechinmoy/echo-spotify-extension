@@ -50,6 +50,14 @@ import java.util.Calendar
 import java.util.Locale
 import java.util.TimeZone
 import kotlin.math.ceil
+import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonArray
+import kotlinx.serialization.json.JsonElement
+import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.JsonPrimitive
+import kotlinx.serialization.json.contentOrNull
+import kotlinx.serialization.json.jsonArray
+import kotlinx.serialization.json.jsonObject
 
 
 fun List<HomeFeed.Chip>.toTabs() = map {
@@ -745,10 +753,414 @@ fun Format.show(
     Format.FLAC_FLAC, Format.FLAC_FLAC_24BIT, Format.OGG_VORBIS_320 -> hasPremium && supportsPlayPlay
     Format.OGG_VORBIS_160 -> supportsPlayPlay
     Format.OGG_VORBIS_96 -> supportsPlayPlay
-    Format.MP4_256 -> hasPremium && showWidevineStreams
-    Format.MP4_128 -> showWidevineStreams
+    Format.MP4_256, Format.MP4_256_DUAL -> hasPremium && showWidevineStreams
+    Format.MP4_128, Format.MP4_128_DUAL -> showWidevineStreams
     else -> false
 }
+
+/** (fileId, numeric format) MP4 entry plus the media key it was listed under. */
+data class MediaEntry(val fileId: String, val format: Int, val key: String)
+
+/**
+ * (fileId, format, mediaKey) MP4 entries from the track-playback/v1/media response.
+ * Entries are tagged with the media key that lists them, because one response can
+ * carry variants (normal song vs music-video audio) under different keys. Unknown
+ * formats are dropped.
+ */
+fun JsonObject.mediaEntries(): List<MediaEntry> {
+    val media = this["media"] as? JsonObject
+    if (media != null) {
+        return media.flatMap { (k, v) ->
+            collectMediaPairs(v).map { it.copy(key = k) }
+        }.distinct()
+    }
+    return collectMediaPairs(this).distinct()
+}
+
+private fun collectMediaPairs(el: JsonElement): List<MediaEntry> {
+    val out = mutableListOf<MediaEntry>()
+    fun collectOne(e: JsonElement) {
+        if (e !is JsonObject) return
+        val id = ((e["file_id"] ?: e["fileId"]) as? JsonPrimitive)
+            ?.contentOrNull?.takeIf { it.isNotBlank() } ?: return
+        val format = (e["format"] as? JsonPrimitive)?.contentOrNull ?: return
+        normalizeMediaFormat(format)?.let { out += MediaEntry(id, it, "") }
+    }
+    fun visit(e: JsonElement) {
+        when (e) {
+            is JsonObject -> {
+                (e["file_ids_mp4"] as? JsonArray)?.forEach(::collectOne)
+                (e["file_ids_mp4_dual"] as? JsonArray)?.forEach(::collectOne)
+                e.values.forEach(::visit)
+            }
+            is JsonArray -> e.forEach(::visit)
+            else -> {}
+        }
+    }
+    visit(el)
+    return out
+}
+
+private fun normalizeMediaFormat(format: String): Int? {
+    format.toIntOrNull()?.let { return it.takeIf { it == 10 || it == 11 || it == 12 || it == 13 } }
+    return when (format.uppercase()) {
+        "MP4_128" -> 10
+        "MP4_256" -> 11
+        "MP4_128_DUAL" -> 12
+        "MP4_256_DUAL" -> 13
+        else -> null
+    }
+}
+
+/** One encoding's templates + profiles (manifests vary: templates at root or per-content). */
+data class VideoContent(
+    val encodingId: String,
+    val initTemplate: String?,
+    val segTemplate: String?,
+    val profiles: List<String>,
+)
+
+/** Music-video manifest (manifests/v9/json supports_drm) in template form. */
+data class VideoManifest(
+    val sourceId: String,
+    val baseUrl: String,
+    val fileType: String,
+    val segLenSec: Int,
+    val durationMs: Long,
+    val contents: List<VideoContent>,
+    /** DRM-shaped keys (pssh/kid/license/protection) seen anywhere in the body. */
+    val drmHints: List<String>,
+    /** Manifest-declared Widevine license path, if present. */
+    val licensePath: String?,
+)
+
+/** Lenient parse of the supports_drm JSON (encoding shapes vary). Null when unusable. */
+fun parseVideoManifest(sourceId: String, raw: String): VideoManifest? = runCatching {
+    val root = Json.parseToJsonElement(raw).jsonObject
+    val bases = root["base_urls"]?.jsonArray
+        ?.mapNotNull { (it as? JsonPrimitive)?.contentOrNull } ?: emptyList()
+    val base = bases.firstOrNull { it.contains("video-") }
+        ?: bases.firstOrNull() ?: return@runCatching null
+    val content0 = root["contents"]?.jsonArray?.firstOrNull() as? JsonObject
+    // Templates + scalars live at ROOT for video manifests — each content
+    // inherits them unless it defines its own.
+    fun JsonObject?.Str(key: String): String? =
+        (this?.get(key) as? JsonPrimitive)?.contentOrNull
+    val fileType = root.Str("file_type") ?: content0.Str("file_type") ?: "mp4"
+    fun profilesOf(c: JsonObject?): List<String> =
+        (root["profiles"]?.jsonArray ?: c?.get("profiles")?.jsonArray)
+            ?.mapNotNull { el ->
+                if (el is JsonObject) {
+                    ((el["id"] ?: el["profile_id"] ?: el["profileId"]) as? JsonPrimitive)?.contentOrNull
+                } else (el as? JsonPrimitive)?.contentOrNull
+            }?.takeIf { it.isNotEmpty() } ?: listOf("13")
+    val contents = root["contents"]?.jsonArray
+        ?.mapNotNull { it as? JsonObject }
+        ?.mapNotNull { c ->
+            val enc = c.Str("encoding_id") ?: return@mapNotNull null
+            VideoContent(
+                encodingId = enc,
+                initTemplate = c.Str("initialization_template")
+                    ?: root.Str("initialization_template"),
+                segTemplate = c.Str("segment_template")
+                    ?: root.Str("segment_template"),
+                profiles = profilesOf(c),
+            )
+        }?.takeIf { it.isNotEmpty() }
+        ?: listOf(
+            VideoContent(
+                encodingId = root.Str("encoding_id") ?: content0.Str("encoding_id") ?: "",
+                initTemplate = root.Str("initialization_template"),
+                segTemplate = root.Str("segment_template"),
+                profiles = profilesOf(content0),
+            )
+        )
+    val segLen = (root.Str("segment_length") ?: content0.Str("segment_length"))
+        ?.toIntOrNull()?.takeIf { it in 1..30 } ?: 4
+    val duration = (root.Str("end_time_millis") ?: content0.Str("end_time_millis"))
+        ?.toLongOrNull() ?: 0L
+    val hints = mutableListOf<String>()
+    fun scan(e: JsonElement, depth: Int) {
+        if (depth > 6) return
+        if (e is JsonObject) for ((k, v) in e) {
+            val kl = k.lowercase()
+            if (v is JsonPrimitive && ("pssh" in kl || "kid" in kl || "license" in kl ||
+                        "protect" in kl || "drm" in kl)
+            ) {
+                hints += "$k=${v.contentOrNull?.take(80)}"
+            } else scan(v, depth + 1)
+        } else if (e is JsonArray) e.forEach { scan(it, depth + 1) }
+    }
+    scan(root, 0)
+    // The manifest declares its own license endpoint; prefer it over any
+    // hardcoded path (robust to regional/rotation changes).
+    val licPath = hints.firstOrNull {
+        it.startsWith("license_server_endpoint=") && "widevine" in it
+    }?.substringAfter('=')?.substringBefore('?')?.takeIf { it.startsWith("/") }
+    VideoManifest(
+        sourceId, base.trimEnd('/'), fileType, segLen,
+        duration, contents, hints.distinct().take(12), licPath,
+    )
+}.getOrNull()
+
+/** Fill {{profile_id}} / {{segment_timestamp}} / {{file_type}} placeholders. */
+fun VideoManifest.segmentUrl(content: VideoContent, profile: String, timestamp: String): String? {
+    val t = content.segTemplate ?: return null
+    return baseUrl + "/" + t
+        .replace("{{profile_id}}", profile)
+        .replace("{{segment_timestamp}}", timestamp)
+        .replace("{{file_type}}", fileType)
+}
+
+fun VideoManifest.initUrl(content: VideoContent, profile: String): String? {
+    val t = content.initTemplate ?: return null
+    return baseUrl + "/" + t
+        .replace("{{profile_id}}", profile)
+        .replace("{{file_type}}", fileType)
+}
+
+/** Widevine system id box scan (moov-aware only, so audio bytes can't false-positive). */
+private val WV_SYSTEM_ID = byteArrayOf(
+    0xED.toByte(), 0xEF.toByte(), 0x8B.toByte(), 0xA9.toByte(),
+    0x79.toByte(), 0xD6.toByte(), 0x4A.toByte(), 0xCE.toByte(),
+    0xA3.toByte(), 0xC8.toByte(), 0x27.toByte(), 0xDC.toByte(),
+    0xD5.toByte(), 0x1D.toByte(), 0x21.toByte(), 0xED.toByte()
+)
+
+private fun eachBox(buf: ByteArray, start: Int, end: Int): List<Triple<String, Int, Int>> {
+    val out = mutableListOf<Triple<String, Int, Int>>()
+    var o = start
+    while (o + 8 <= end) {
+        val size = ((buf[o].toInt() and 0xFF) shl 24) or
+            ((buf[o + 1].toInt() and 0xFF) shl 16) or
+            ((buf[o + 2].toInt() and 0xFF) shl 8) or
+            (buf[o + 3].toInt() and 0xFF)
+        if (size < 8 || o + size > end) return out
+        out += Triple(buf.copyOfRange(o + 4, o + 8).toString(Charsets.US_ASCII), o, o + size)
+        o += size
+    }
+    return out
+}
+
+/** Full Widevine PSSH box bytes from an init segment (moov/pssh), or null. */
+fun findInitPssh(init: ByteArray): ByteArray? {
+    for ((t, s, e) in eachBox(init, 0, init.size)) {
+        if (t != "moov") continue
+        for ((t2, s2, e2) in eachBox(init, s + 8, e)) {
+            if (t2 == "pssh" && e2 - s2 >= 32 &&
+                init.copyOfRange(s2 + 12, s2 + 28).contentEquals(WV_SYSTEM_ID)
+            ) return init.copyOfRange(s2, e2)
+        }
+    }
+    return null
+}
+
+/** Track role from an init segment: "soun", "vide", or null. */
+fun initTrackKind(init: ByteArray): String? {
+    for ((t, s, e) in eachBox(init, 0, init.size)) {
+        if (t != "moov") continue
+        for ((t2, s2, e2) in eachBox(init, s + 8, e)) {
+            if (t2 != "trak") continue
+            for ((t3, s3, e3) in eachBox(init, s2 + 8, e2)) {
+                if (t3 != "mdia") continue
+                for ((t4, s4, e4) in eachBox(init, s3 + 8, e3)) {
+                    if (t4 == "hdlr" && e4 - s4 >= 20) {
+                        return init.copyOfRange(s4 + 16, s4 + 20).toString(Charsets.US_ASCII)
+                    }
+                }
+            }
+        }
+    }
+    return null
+}
+
+/** Video codec string from an init segment (avc1.PPCCLL via avcC), or null.
+ * CENC uses the encrypted sample entry (encv, not avc1); children start 86
+ * bytes in (8 box header + 78 entry payload), verified against real inits. */
+fun initVideoCodec(init: ByteArray): String? = runCatching {
+    for ((t, s, e) in eachBox(init, 0, init.size)) {
+        if (t != "moov") continue
+        for ((t2, s2, e2) in eachBox(init, s + 8, e)) {
+            if (t2 != "trak") continue
+            for ((t3, s3, e3) in eachBox(init, s2 + 8, e2)) {
+                if (t3 != "mdia") continue
+                for ((t4, s4, e4) in eachBox(init, s3 + 8, e3)) {
+                    if (t4 != "minf") continue
+                    for ((t5, s5, e5) in eachBox(init, s4 + 8, e4)) {
+                        if (t5 != "stbl") continue
+                        for ((t6, s6, e6) in eachBox(init, s5 + 8, e5)) {
+                            // stsd children start past version/flags + entry_count.
+                            if (t6 != "stsd") continue
+                            for ((t7, s7, e7) in eachBox(init, s6 + 16, e6)) {
+                                if (t7 == "avc1" || t7 == "encv") {
+                                    for ((t8, s8, e8) in eachBox(init, s7 + 86, e7)) {
+                                        if (t8 == "avcC" && e8 - s8 >= 12) {
+                                            val b = init.copyOfRange(s8 + 9, s8 + 12)
+                                            return@runCatching "avc1.%02x%02x%02x".format(
+                                                b[0], b[1], b[2]
+                                            )
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    null
+}.getOrNull()
+
+/** Approximate bandwidth from an avc1 codec string (level byte drives it).
+ * Lets the MPD ladder sort correctly even when the manifest orders profiles
+ * any-which-way (proven: ids 5,4 carried the LOWEST levels). */
+fun avcBandwidth(codec: String): Int {
+    val level = runCatching {
+        codec.substringAfter("avc1.").take(6).substring(4, 6).toInt(16)
+    }.getOrNull() ?: return 2000000
+    return when {
+        level <= 0x0d -> 500000
+        level <= 0x15 -> 1200000
+        level <= 0x1e -> 2000000
+        level <= 0x1f -> 3000000
+        level <= 0x28 -> 6000000
+        else -> 8000000
+    }
+}
+
+private fun xmlEsc(s: String): String = s
+    .replace("&", "&amp;")
+    .replace("<", "&lt;")
+    .replace("\"", "&quot;")
+
+/**
+ * Static MPD with per-representation SegmentTemplates: every playable
+ * (content, profile) pair becomes a Representation under its role's
+ * AdaptationSet, all sharing the one Widevine KID (browser-verified:
+ * identical PSSH across inits). Exo adapts across qualities AND survives a
+ * dead profile. Playback = stock Exo DASH + video/license grants.
+ */
+data class MvRep(
+    val content: VideoContent,
+    val profile: String,
+    /** "vide" or "soun" */
+    val kind: String,
+    val codec: String,
+    val bandwidth: Int,
+)
+
+fun buildVideoMpd(
+    manifest: VideoManifest,
+    reps: List<MvRep>,
+    psshB64: String,
+): String {
+    val durS = (manifest.durationMs / 1000.0).let { "PT${it}S" }
+    // Segments are named by SECOND offsets (0, 4, 8 … 40 — browser-verified,
+    // and the 4s-play-then-404 proved $Number$ wrong), so $Time$ addressing
+    // with an explicit timeline. r covers the whole period.
+    val total = kotlin.math.ceil(manifest.durationMs / 1000.0 / manifest.segLenSec)
+        .toInt().coerceAtLeast(1)
+    fun repXml(rep: MvRep, id: String): String {
+        val initT = rep.content.initTemplate ?: return ""
+        val segT = rep.content.segTemplate ?: return ""
+        val init = xmlEsc(
+            manifest.baseUrl + "/" + initT
+                .replace("{{profile_id}}", rep.profile)
+                .replace("{{file_type}}", manifest.fileType)
+        )
+        val media = xmlEsc(
+            manifest.baseUrl + "/" + segT
+                .replace("{{profile_id}}", rep.profile)
+                .replace("{{segment_timestamp}}", "\$Time\$")
+                .replace("{{file_type}}", manifest.fileType)
+        )
+        return "<Representation id=\"$id\" bandwidth=\"${rep.bandwidth}\" codecs=\"${rep.codec}\">" +
+            "<SegmentTemplate timescale=\"1\" initialization=\"$init\" media=\"$media\">" +
+            "<SegmentTimeline><S t=\"0\" d=\"${manifest.segLenSec}\" r=\"${total - 1}\"/></SegmentTimeline>" +
+            "</SegmentTemplate></Representation>"
+    }
+    val sets = StringBuilder()
+    // Video AdaptationSet first (Exo prefers first set for initial selection).
+    var vi = 0
+    for (rep in reps.filter { it.kind == "vide" }) {
+        if (vi == 0) {
+            sets.append("<AdaptationSet mimeType=\"video/mp4\">")
+            sets.append("<ContentProtection schemeIdUri=\"urn:uuid:edef8ba9-79d6-4ace-a3c8-27dc0d51d21e\">")
+            sets.append("<cenc:pssh>$psshB64</cenc:pssh></ContentProtection>")
+        }
+        sets.append(repXml(rep, "v$vi"))
+        vi++
+    }
+    if (vi > 0) sets.append("</AdaptationSet>")
+    var ai = 0
+    for (rep in reps.filter { it.kind == "soun" }) {
+        if (ai == 0) {
+            sets.append("<AdaptationSet mimeType=\"audio/mp4\" lang=\"und\">")
+            sets.append("<ContentProtection schemeIdUri=\"urn:uuid:edef8ba9-79d6-4ace-a3c8-27dc0d51d21e\">")
+            sets.append("<cenc:pssh>$psshB64</cenc:pssh></ContentProtection>")
+        }
+        sets.append(repXml(rep, "a$ai"))
+        ai++
+    }
+    if (ai > 0) sets.append("</AdaptationSet>")
+    return "<?xml version=\"1.0\" encoding=\"UTF-8\"?>" +
+        "<MPD type=\"static\" mediaPresentationDuration=\"$durS\" minBufferTime=\"PT4S\" " +
+        "profiles=\"urn:mpeg:dash:profile:isoff-live:2011\" " +
+        "xmlns=\"urn:mpeg:dash:schema:mpd:2011\" xmlns:cenc=\"urn:mpeg:cenc:2013\">" +
+        "<Period>$sets</Period></MPD>"
+}
+
+/**
+ * Exactly-32-hex strings (manifest source ids) anywhere in the media JSON,
+ * with key context. Audio fileIds are 40-hex and never match.
+ */
+fun JsonObject.videoSourceCandidates(): List<String> {
+    val out = LinkedHashSet<String>()
+    val hex32 = Regex("[0-9a-f]{32}")
+    fun visit(e: JsonElement, path: String) {
+        when (e) {
+            is JsonObject -> for ((k, v) in e) visit(v, "$path.$k")
+            is JsonArray -> e.forEachIndexed { i, v -> visit(v, "$path[$i]") }
+            is JsonPrimitive -> if (e.isString) {
+                val s = e.contentOrNull ?: return
+                if (s.length == 32 && hex32.matches(s)) out += "$s@$path"
+            }
+        }
+    }
+    visit(this, "$")
+    return out.toList()
+}
+
+/** One-line structure summary of a supports_drm body (no secrets: no URLs). */
+fun describeVideoManifest(raw: String): String = runCatching {
+    val root = Json.parseToJsonElement(raw).jsonObject
+    val sb = StringBuilder("root=[${root.keys.joinToString(",")}]")
+    val contents = root["contents"]?.jsonArray
+    sb.append(" contents=${contents?.size ?: 0}")
+    contents?.forEachIndexed { ci, el ->
+        if (el is JsonObject) {
+            sb.append(" c$ci keys=[${el.keys.joinToString(",")}]")
+            sb.append(" enc=${(el["encoding_id"] as? JsonPrimitive)?.contentOrNull?.take(8)}")
+            sb.append(" ft=${(el["file_type"] as? JsonPrimitive)?.contentOrNull}")
+            sb.append(" dur=${(el["end_time_millis"] as? JsonPrimitive)?.contentOrNull}")
+            val profs = (el["profiles"] as? JsonArray)?.map {
+                ((it as? JsonObject)?.get("id") as? JsonPrimitive)?.contentOrNull
+                    ?: (it as? JsonPrimitive)?.contentOrNull
+            }?.take(6)
+            sb.append(" profs=$profs")
+            el["profiles"]?.jsonArray?.forEachIndexed { pi, p ->
+                if (p is JsonObject) {
+                    val scalars = p.entries.mapNotNull { (k, v) ->
+                        (v as? JsonPrimitive)?.contentOrNull?.let { "$k=$it" }
+                    }.take(8).joinToString(",")
+                    sb.append(" p$pi{$scalars}")
+                } else sb.append(" p$pi=$p")
+            }
+        }
+    }
+    sb.toString().take(1200)
+}.getOrNull() ?: "unparsable"
 
 private fun BatchedExtensionResponse.extensionBytes(
     kind: ExtendedMetadataProto.ExtensionKind
@@ -768,6 +1180,10 @@ fun BatchedExtensionResponse.toTrack(
     supportsPlayPlay: Boolean,
     showWidevineStreams: Boolean,
     canvas: Streamable?,
+    mediaEntries: List<MediaEntry> = emptyList(),
+    showMv: Boolean = true,
+    preferMv: Boolean = false,
+    mvSourceId: String? = null,
 ): Track {
 
     val trackBytes = extensionBytes(ExtendedMetadataProto.ExtensionKind.TRACK_V4) ?: ByteArray(0)
@@ -812,6 +1228,35 @@ fun BatchedExtensionResponse.toTrack(
     )
 
     val streamables = mutableListOf<Streamable>()
+
+    // Web-player MP4 entries (if Widevine enabled)
+    if (mediaEntries.isNotEmpty() && showWidevineStreams) {
+        val own = mediaEntries.filter { it.key.isBlank() || it.key == id }
+        val pool = if (own.isNotEmpty()) own else mediaEntries
+        val candidates = pool.filter { e ->
+            (e.format == 10 || e.format == 12 || hasPremium) && showWidevineStreams
+        }
+        val chosen = candidates.firstOrNull()
+        chosen?.let { e ->
+            val formatName = AudioFormat.name(e.format)
+            streamables.add(
+                Streamable.server(
+                    id = e.fileId,
+                    quality = AudioFormat.quality(e.format),
+                    title = formatName.replace("_", " "),
+                    extras = mapOf(
+                        "fileId" to e.fileId,
+                        "formatNum" to e.format.toString(),
+                        "formatName" to formatName,
+                        "gid" to (gid?.toHex() ?: ""),
+                        "durMs" to (trackProto?.duration ?: 0).toString(),
+                    )
+                )
+            )
+        }
+    }
+
+    // PlayPlay / standard audio files
     files.forEach { file ->
         file.takeIf { it.hasFileId() && it.format.show(hasPremium, supportsPlayPlay, showWidevineStreams) }
             ?.let {
@@ -828,10 +1273,32 @@ fun BatchedExtensionResponse.toTrack(
                             "formatNum" to formatNum.toString(),
                             "formatName" to formatName,
                             "gid" to (gid?.toHex() ?: ""),
+                            "durMs" to (trackProto?.duration ?: 0).toString(),
                         ), vorbisFallback.takeIf { AudioStreamFallback.isFlac(formatNum) })
                     )
                 )
             }
+    }
+
+    // Music Video (picture)
+    val maxAudioQuality = streamables.maxOfOrNull { it.quality } ?: 0
+    val videoRow = if (showMv && mvSourceId != null) {
+        Streamable.server(
+            id = "mv:$mvSourceId",
+            quality = if (preferMv) maxOf(maxAudioQuality + 1, 3) else 0,
+            title = "Music Video",
+            extras = mapOf(
+                "mvSource" to mvSourceId,
+                "dur" to (trackProto?.duration ?: 0).toString(),
+                "gid" to (gid?.toHex() ?: ""),
+            ),
+        )
+    } else null
+
+    if (preferMv && videoRow != null) {
+        streamables.add(0, videoRow)
+    } else if (videoRow != null) {
+        streamables.add(videoRow)
     }
 
     val alb = trackProto?.takeIf { it.hasAlbum() }?.album?.let { album ->
