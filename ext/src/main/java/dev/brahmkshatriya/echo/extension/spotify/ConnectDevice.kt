@@ -271,10 +271,6 @@ object ConnectDevice {
         }
     }
 
-    private fun trackUriFor(fileId: String): String? = synchronized(trackByFile) {
-        trackByFile[fileId]
-    }
-
     /**
      * Full reference start for one track: play-command + dealer-await ->
      * start-event batch -> before_track_load (0) -> started_playing
