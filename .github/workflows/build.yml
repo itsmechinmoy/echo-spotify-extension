@@ -4,6 +4,11 @@ on:
   push:
     branches:
       - main
+      - master
+  workflow_dispatch:
+
+permissions:
+  contents: write
 
 jobs:
   build:
@@ -24,27 +29,19 @@ jobs:
 
       - name: Cook Env
         run: |
-          echo -e "## ${{ env.NAME }}\n${{ github.event.head_commit.message }}" > commit.txt
-          version=$( echo ${{ github.event.head_commit.id }} | cut -c1-7 )
+          echo -e "## ${{ env.NAME }}\n${{ github.event.head_commit.message || github.sha }}" > commit.txt
+          version=$( echo ${{ github.sha }} | cut -c1-7 )
           echo "VERSION=v$version" >> $GITHUB_ENV
           echo "APP_PATH=app/build/${{ env.TAG }}-$version.eapk" >> $GITHUB_ENV
-          echo "${{ secrets.KEYSTORE_B64 }}" | base64 -d > $GITHUB_WORKSPACE/signing-key.jks
+          echo "${{ secrets.KEYSTORE_B64 }}" | base64 -di > $GITHUB_WORKSPACE/signing-key.jks
           chmod +x ./gradlew
-
-      - name: Download Dependency
-        shell: bash
-        env:
-          DEPENDENCY_URL: ${{ secrets.DEPENDENCY_URL }}
-        run: |
-          mkdir -p app/libs
-          curl -L -o app/libs/unplayplay.aar ${{ env.DEPENDENCY_URL }}
 
       - name: Build with Gradle
         run: |
           ./gradlew assembleRelease \
           -Pandroid.injected.signing.store.file=$GITHUB_WORKSPACE/signing-key.jks \
           -Pandroid.injected.signing.store.password=${{ secrets.PASSWORD }} \
-          -Pandroid.injected.signing.key.alias=key0 \
+          -Pandroid.injected.signing.key.alias=itsmechinmoy-echo \
           -Pandroid.injected.signing.key.password=${{ secrets.PASSWORD }}
           
           cp app/build/outputs/apk/release/app-release.apk ${{ env.APP_PATH }}
@@ -73,6 +70,7 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Upload APK to Discord
+        if: env.WEBHOOK != ''
         shell: bash
         env:
           WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
@@ -84,6 +82,7 @@ jobs:
           ${{ env.WEBHOOK }}
 
       - name: Upload APK to Telegram
+        if: env.BOT_ID != '' && env.CHANNEL_ID != ''
         shell: bash
         env:
           BOT_ID: ${{ secrets.TELEGRAM_BOT_ID }}
