@@ -74,7 +74,8 @@ class SpotifyApi {
                         builder.header("Authorization", "Bearer $it")
                 }
                 clientTokenManager.clientToken?.let {
-                    builder.header("client-token", it)
+                    if (request.header("client-token") == null)
+                        builder.header("client-token", it)
                 }
                 builder.header(
                     "spotify-app-version",
