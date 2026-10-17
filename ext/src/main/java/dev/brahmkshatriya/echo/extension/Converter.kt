@@ -1132,36 +1132,6 @@ fun JsonObject.videoSourceCandidates(): List<String> {
     return out.toList()
 }
 
-/** One-line structure summary of a supports_drm body (no secrets: no URLs). */
-fun describeVideoManifest(raw: String): String = runCatching {
-    val root = Json.parseToJsonElement(raw).jsonObject
-    val sb = StringBuilder("root=[${root.keys.joinToString(",")}]")
-    val contents = root["contents"]?.jsonArray
-    sb.append(" contents=${contents?.size ?: 0}")
-    contents?.forEachIndexed { ci, el ->
-        if (el is JsonObject) {
-            sb.append(" c$ci keys=[${el.keys.joinToString(",")}]")
-            sb.append(" enc=${(el["encoding_id"] as? JsonPrimitive)?.contentOrNull?.take(8)}")
-            sb.append(" ft=${(el["file_type"] as? JsonPrimitive)?.contentOrNull}")
-            sb.append(" dur=${(el["end_time_millis"] as? JsonPrimitive)?.contentOrNull}")
-            val profs = (el["profiles"] as? JsonArray)?.map {
-                ((it as? JsonObject)?.get("id") as? JsonPrimitive)?.contentOrNull
-                    ?: (it as? JsonPrimitive)?.contentOrNull
-            }?.take(6)
-            sb.append(" profs=$profs")
-            el["profiles"]?.jsonArray?.forEachIndexed { pi, p ->
-                if (p is JsonObject) {
-                    val scalars = p.entries.mapNotNull { (k, v) ->
-                        (v as? JsonPrimitive)?.contentOrNull?.let { "$k=$it" }
-                    }.take(8).joinToString(",")
-                    sb.append(" p$pi{$scalars}")
-                } else sb.append(" p$pi=$p")
-            }
-        }
-    }
-    sb.toString().take(1200)
-}.getOrNull() ?: "unparsable"
-
 private fun BatchedExtensionResponse.extensionBytes(
     kind: ExtendedMetadataProto.ExtensionKind
 ): ByteArray? =
