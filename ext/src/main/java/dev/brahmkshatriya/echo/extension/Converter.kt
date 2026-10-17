@@ -748,68 +748,17 @@ fun Canvas.toStreamable(): Streamable? {
 }
 
 fun Format.show(
-    hasPremium: Boolean, supportsPlayPlay: Boolean, showWidevineStreams: Boolean,
+    hasPremium: Boolean,
+    supportsPlayPlay: Boolean,
+    showWidevineStreams: Boolean,
 ) = when (this) {
+    Format.MP3_96, Format.MP3_160, Format.MP3_256, Format.MP3_320 -> false
     Format.FLAC_FLAC, Format.FLAC_FLAC_24BIT, Format.OGG_VORBIS_320 -> hasPremium && supportsPlayPlay
     Format.OGG_VORBIS_160 -> supportsPlayPlay
     Format.OGG_VORBIS_96 -> supportsPlayPlay
-    Format.MP4_256, Format.MP4_256_DUAL -> hasPremium && showWidevineStreams
-    Format.MP4_128, Format.MP4_128_DUAL -> showWidevineStreams
+    Format.MP4_256 -> hasPremium && showWidevineStreams
+    Format.MP4_128 -> showWidevineStreams
     else -> false
-}
-
-/** (fileId, numeric format) MP4 entry plus the media key it was listed under. */
-data class MediaEntry(val fileId: String, val format: Int, val key: String)
-
-/**
- * (fileId, format, mediaKey) MP4 entries from the track-playback/v1/media response.
- * Entries are tagged with the media key that lists them, because one response can
- * carry variants (normal song vs music-video audio) under different keys. Unknown
- * formats are dropped.
- */
-fun JsonObject.mediaEntries(): List<MediaEntry> {
-    val media = this["media"] as? JsonObject
-    if (media != null) {
-        return media.flatMap { (k, v) ->
-            collectMediaPairs(v).map { it.copy(key = k) }
-        }.distinct()
-    }
-    return collectMediaPairs(this).distinct()
-}
-
-private fun collectMediaPairs(el: JsonElement): List<MediaEntry> {
-    val out = mutableListOf<MediaEntry>()
-    fun collectOne(e: JsonElement) {
-        if (e !is JsonObject) return
-        val id = ((e["file_id"] ?: e["fileId"]) as? JsonPrimitive)
-            ?.contentOrNull?.takeIf { it.isNotBlank() } ?: return
-        val format = (e["format"] as? JsonPrimitive)?.contentOrNull ?: return
-        normalizeMediaFormat(format)?.let { out += MediaEntry(id, it, "") }
-    }
-    fun visit(e: JsonElement) {
-        when (e) {
-            is JsonObject -> {
-                (e["file_ids_mp4"] as? JsonArray)?.forEach(::collectOne)
-                (e["file_ids_mp4_dual"] as? JsonArray)?.forEach(::collectOne)
-                e.values.forEach(::visit)
-            }
-            is JsonArray -> e.forEach(::visit)
-            else -> {}
-        }
-    }
-    visit(el)
-    return out
-}
-
-private fun normalizeMediaFormat(format: String): Int? {
-    format.toIntOrNull()?.let { return it.takeIf { it == 10 || it == 11 || it == 12 || it == 13 } }
-    return when (format.uppercase()) {
-        "MP4_128" -> 10
-        "MP4_256" -> 11
-        "MP4_128_DUAL" -> 12
-        "MP4_256_DUAL" -> 13
-        else -> null
-    }
 }
 
 /** One encoding's templates + profiles (manifests vary: templates at root or per-content). */
@@ -1147,7 +1096,6 @@ fun BatchedExtensionResponse.toTrack(
     supportsPlayPlay: Boolean,
     showWidevineStreams: Boolean,
     canvas: Streamable?,
-    mediaEntries: List<MediaEntry> = emptyList(),
     showMv: Boolean = true,
     preferMv: Boolean = false,
     mvSourceId: String? = null,
@@ -1195,33 +1143,6 @@ fun BatchedExtensionResponse.toTrack(
     )
 
     val streamables = mutableListOf<Streamable>()
-
-    // Web-player MP4 entries (if Widevine enabled)
-    if (mediaEntries.isNotEmpty() && showWidevineStreams) {
-        val own = mediaEntries.filter { it.key.isBlank() || it.key == id }
-        val pool = if (own.isNotEmpty()) own else mediaEntries
-        val candidates = pool.filter { e ->
-            (e.format == 10 || e.format == 12 || hasPremium) && showWidevineStreams
-        }
-        val chosen = candidates.firstOrNull()
-        chosen?.let { e ->
-            val formatName = AudioFormat.name(e.format)
-            streamables.add(
-                Streamable.server(
-                    id = e.fileId,
-                    quality = AudioFormat.quality(e.format),
-                    title = formatName.replace("_", " "),
-                    extras = mapOf(
-                        "fileId" to e.fileId,
-                        "formatNum" to e.format.toString(),
-                        "formatName" to formatName,
-                        "gid" to (gid?.toHex() ?: ""),
-                        "durMs" to (trackProto?.duration ?: 0).toString(),
-                    )
-                )
-            )
-        }
-    }
 
     // PlayPlay / standard audio files
     files.forEach { file ->
