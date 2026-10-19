@@ -152,10 +152,37 @@ open class SpotifyExtension : ExtensionClient, LoginClient.WebView,
     private val cdnClient by lazy { OkHttpClient() }
     val queries by lazy { Queries(api) }
 
+    @OptIn(ExperimentalEncodingApi::class)
+    private val warningLoginUrl by lazy {
+        val html = """
+            <!DOCTYPE html>
+            <html>
+            <head>
+            <meta name="viewport" content="width=device-width, initial-scale=1.0">
+            <style>
+              body { background: #121212; color: #fff; font-family: sans-serif; padding: 24px; text-align: center; }
+              .warn { color: #f59e0b; font-size: 20px; font-weight: bold; margin-bottom: 12px; }
+              p { color: #b3b3b3; font-size: 14px; line-height: 1.5; margin-bottom: 16px; }
+              a.btn { display: block; background: #1db954; color: #000; font-weight: bold; padding: 12px; border-radius: 24px; text-decoration: none; margin: 16px 0; }
+              a.link { color: #1db954; text-decoration: underline; font-size: 13px; }
+            </style>
+            </head>
+            <body>
+              <div class="warn">⚠️ Account Risk Warning</div>
+              <p>Spotify suspends accounts using third-party clients for Terms violations. Use a secondary/burner account to avoid losing your main account.</p>
+              <p><a class="link" href="https://echomusicdocs.vercel.app/docs/spotify-appeal">Spotify Appeal & Prevention Guide</a></p>
+              <a class="btn" href="https://accounts.spotify.com/en/login?allow_password=1">Continue to Login</a>
+            </body>
+            </html>
+        """.trimIndent()
+        val base64 = Base64.Default.encode(html.toByteArray(Charsets.UTF_8))
+        "data:text/html;base64,$base64"
+    }
+
     override val webViewRequest = object : WebViewRequest.Cookie<List<User>> {
         override val dontCache = true
         override val initialUrl =
-            "https://accounts.spotify.com/en/login?allow_password=1".toGetRequest(
+            warningLoginUrl.toGetRequest(
                 mapOf("User-Agent" to WebPlayerConfig.USER_AGENT)
             )
         override val stopUrlRegex =
